@@ -448,6 +448,10 @@ def test_admin_can_pick_a_template_for_one_run(site, fake_ourmind, server):
     assert 'id="template"' in page
     assert "SOEP consult" in page and "Vergaderverslag" in page
     assert 'value="13:template" selected' in page      # the standing rule
+    # ...and the panel opens on the route that rule names, not on whichever
+    # provider happens to sort first. Opening on a route nobody chose is what
+    # makes the template beside it look empty for the wrong reason.
+    assert '<option value="ourmind" selected>' in page
 
     server.admin.post(f"/admin/api/sessions/{rec.session_id}/processing",
                       json={"route": "ourmind", "template_id": "77",

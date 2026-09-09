@@ -839,7 +839,15 @@ def _processing_panel(d: dict[str, Any]) -> str:
         controls = ('<p class="muted">Voor deze opnamemodus is geen verwerkingsroute '
                     'toegestaan.</p>')
     else:
-        options = "".join(f'<option value="{_e(r)}">{_e(r)}</option>' for r in allowed)
+        # Open on the route this user actually configured for this kind of
+        # recording, not on whichever provider sorts first. Otherwise the
+        # panel opens showing a route nobody chose, and the template picker
+        # beside it looks empty for the wrong reason.
+        standing = (d.get("owner_rule") or {}).get("route") or ""
+        options = "".join(
+            f'<option value="{_e(r)}"'
+            f'{" selected" if r == standing else ""}>{_e(r)}</option>'
+            for r in allowed)
         # The template only means anything for OurMind, and only if we could
         # reach it. The picker is hidden for other routes rather than shown
         # doing nothing.
