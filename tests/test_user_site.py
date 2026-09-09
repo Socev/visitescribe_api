@@ -420,3 +420,71 @@ def test_a_disabled_user_cannot_sign_in(site, fake_ourmind, server):
     resp = _sign_in(site)
     assert resp.status_code == 200
     assert "uitgeschakeld" in resp.text.lower()
+
+
+def test_admin_can_pick_a_template_for_one_run(site, fake_ourmind, server):
+    """Choosing OurMind by hand must also let you choose the template.
+
+    It did not: the panel had a route picker and nothing else, so a manual run
+    silently used whatever standing rule existed -- or none.
+    """
+    from app import processing, users
+
+    user = users.create("dokter@praktijk.nl")
+    server.register_device("visitescribe-001")
+    users.bind_device("visitescribe-001", user["user_id"])
+    _sign_in(site)
+
+    # a standing rule that the one-off choice must be able to override
+    users.set_rule(user["user_id"], "single_patient", route="ourmind",
+                   template_id="13", template_type="template")
+
+    rec = Recorder(server, device_id="visitescribe-001")
+    rec.add_chunk(seconds=1.0)
+    rec.create(); rec.upload_all(); rec.complete()
+
+    server.admin_login()
+    page = server.admin.get(f"/admin/sessions/{rec.session_id}").text
+    assert 'id="template"' in page
+    assert "SOEP consult" in page and "Vergaderverslag" in page
+    assert 'value="13:template" selected' in page      # the standing rule
+
+    server.admin.post(f"/admin/api/sessions/{rec.session_id}/processing",
+                      json={"route": "ourmind", "template_id": "77",
+                            "template_type": "doctor_template"})
+    assert processing.run_once() is True     # transcribe
+    assert processing.run_once() is True     # note
+
+    used = Fake.generate_bodies[-1]["data"]["attributes"]["template"]
+    assert used == {"id": 77, "type": "doctor_template"}, "one-off choice ignored"
+
+
+def test_the_template_picker_explains_itself_when_empty(server):
+    """An empty picker with no reason gets reported as "it shows nothing"."""
+    server.register_device("visitescribe-001")
+    rec = Recorder(server, device_id="visitescribe-001")
+    rec.add_chunk(seconds=1.0)
+    rec.create(); rec.upload_all(); rec.complete()
+
+    server.admin_login()
+    page = server.admin.get(f"/admin/sessions/{rec.session_id}").text
+    assert "geen gebruiker aan dit device gekoppeld" in page
+
+
+def test_the_global_kill_switch_announces_itself(site, fake_ourmind, server,
+                                                 override_settings):
+    """A server switch that disables a user's checkbox must say so.
+
+    The chart shipped with VS_AUTO_PROCESS=false, which turned every user's
+    "meteen versturen" into a checkbox that saved fine and did nothing.
+    """
+    from app import users
+
+    users.create("dokter@praktijk.nl")
+    _sign_in(site)
+
+    assert "staat op deze server uitgeschakeld" not in site.get("/instellingen").text
+
+    with override_settings(auto_process=False):
+        page = site.get("/instellingen").text
+    assert "staat op deze server uitgeschakeld" in page

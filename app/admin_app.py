@@ -279,8 +279,10 @@ def create_admin_app() -> FastAPI:
         who = guard(request)
         body = await _body(request)
         route = str(body.get("route") or "").strip().lower()
-        result = processing.enqueue(session_id, route, actor=who,
-                                    force=bool(body.get("force")))
+        result = processing.enqueue(
+            session_id, route, actor=who, force=bool(body.get("force")),
+            template_id=str(body.get("template_id") or ""),
+            template_type=str(body.get("template_type") or ""))
         return JSONResponse(result)
 
     @app.post("/admin/api/sessions/{session_id}/processing/cancel",
@@ -784,11 +786,34 @@ def _session_detail(session_id: str) -> dict[str, Any] | None:
         "processing": processing_meta,
         "results": processing.results_for(session_id),
         "allowed_routes": sorted(routing.allowed_for(session["mode"])),
+        **_owner_templates(session_id, session["mode"]),
         "audit": audit.recent(limit=200, session_id=session_id),
         "purges": [dict(r) for r in db.query(
             "SELECT * FROM purges WHERE session_id = ? ORDER BY id DESC", (session_id,))],
         "states": list(ALL_STATES),
     }
+
+
+def _owner_templates(session_id: str, mode: str) -> dict[str, Any]:
+    """The OurMind templates of whoever owns this recording.
+
+    Reachable only through that user's own token, so this returns an
+    explanation rather than an empty list when it cannot be had -- an empty
+    picker with no reason is the kind of thing that gets reported as "it does
+    not show anything".
+    """
+    owner = users.owner_of_session(session_id)
+    if owner is None:
+        return {"templates": [], "owner_rule": {},
+                "template_error": "geen gebruiker aan dit device gekoppeld"}
+    rule = users.rule(owner["user_id"], mode) or {}
+    try:
+        client = get_provider("ourmind", token=users.access_token(owner["user_id"]))
+        return {"templates": client.templates(), "owner_rule": rule,
+                "template_error": ""}
+    except Exception as exc:  # noqa: BLE001
+        return {"templates": [], "owner_rule": rule,
+                "template_error": str(exc)[:200]}
 
 
 def _users_data() -> dict[str, Any]:

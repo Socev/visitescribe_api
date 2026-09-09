@@ -840,8 +840,30 @@ def _processing_panel(d: dict[str, Any]) -> str:
                     'toegestaan.</p>')
     else:
         options = "".join(f'<option value="{_e(r)}">{_e(r)}</option>' for r in allowed)
+        # The template only means anything for OurMind, and only if we could
+        # reach it. The picker is hidden for other routes rather than shown
+        # doing nothing.
+        templates = d.get("templates") or []
+        rule = d.get("owner_rule") or {}
+        if templates:
+            topts = ['<option value="">standaard van OurMind</option>']
+            for tpl in templates:
+                value = f"{tpl['id']}:{tpl['type']}"
+                sel = " selected" if rule.get("template_id") == tpl["id"] else ""
+                topts.append(f'<option value="{_e(value)}"{sel}>{_e(tpl["title"])}</option>')
+            template_field = (f'<div id="templateField"><label>OurMind-template</label>'
+                              f'<select id="template">{"".join(topts)}</select></div>')
+        elif "ourmind" in allowed:
+            why = _e(d.get("template_error") or
+                     "geen gebruiker aan dit device gekoppeld")
+            template_field = (f'<div id="templateField"><label>OurMind-template</label>'
+                              f'<div class="muted" style="padding-top:7px">'
+                              f'niet op te halen: {why}</div></div>')
+        else:
+            template_field = ""
         controls = f"""<div class="row">
-<div><label>Route</label><select id="route">{options}</select></div>
+<div><label>Route</label><select id="route" onchange="syncTemplateField()">{options}</select></div>
+{template_field}
 <div class="narrow"><button class="primary" onclick="startProcessing()">Verwerken</button></div>
 <div class="narrow"><button onclick="cancelProcessing()">Annuleren</button></div>
 </div>
@@ -912,11 +934,23 @@ opgenomen, niet uit wie de route kiest.</p>"""
 <div class="panel">{controls}{jobs_block}{cost_block}</div>
 {review}
 <script>
+function syncTemplateField(){{
+  const field = document.getElementById('templateField');
+  if(!field) return;
+  const route = document.getElementById('route').value;
+  field.style.display = (route === 'ourmind') ? '' : 'none';
+}}
 async function startProcessing(){{
-  await act('/admin/api/sessions/'+SID+'/processing',
-    {{route: document.getElementById('route').value}});
+  const tpl = document.getElementById('template');
+  const body = {{route: document.getElementById('route').value}};
+  if(tpl && body.route === 'ourmind' && tpl.value){{
+    const [id, type] = tpl.value.split(':');
+    body.template_id = id; body.template_type = type || 'template';
+  }}
+  await act('/admin/api/sessions/'+SID+'/processing', body);
   toast('In de wachtrij gezet','ok'); setTimeout(()=>location.reload(), 900);
 }}
+document.addEventListener('DOMContentLoaded', syncTemplateField);
 async function cancelProcessing(){{
   await act('/admin/api/sessions/'+SID+'/processing/cancel', {{}});
   toast('Geannuleerd','ok'); setTimeout(()=>location.reload(), 700);

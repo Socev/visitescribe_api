@@ -213,8 +213,15 @@ def render_settings(d: dict[str, Any], who: str) -> str:
     templates = d.get("templates") or []
     rules = d.get("rules") or {}
     banner = ""
+    if not d.get("auto_allowed", True):
+        # A server-wide switch that silently disables a per-user checkbox is a
+        # trap; it has to announce itself where the checkbox is.
+        banner += ('<div class="banner warn">Automatisch versturen staat op deze '
+                   'server uitgeschakeld. Je kunt het hieronder wel instellen, '
+                   'maar er vertrekt niets vanzelf totdat de beheerder het '
+                   'aanzet.</div>')
     if d.get("template_error"):
-        banner = (f'<div class="banner warn">Templates konden niet opgehaald '
+        banner += (f'<div class="banner warn">Templates konden niet opgehaald '
                   f'worden: {_e(d["template_error"])}</div>')
 
     rows = []

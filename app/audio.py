@@ -22,6 +22,23 @@ from .errors import ApiError
 from .util import b64decode_strict
 
 
+# What we can hand a provider, and how to write it. FLAC is the native form
+# -- it is what the recorder produced and it is lossless -- but not every
+# provider accepts it: OurMind refuses it with "invalid-format", and their
+# documentation says nothing beyond `audio/*`.
+FORMATS: dict[str, tuple[str, str, str, str]] = {
+    # name: (libsndfile format, subtype, file extension, content type)
+    "flac": ("FLAC", "PCM_16", ".flac", "audio/flac"),
+    "wav": ("WAV", "PCM_16", ".wav", "audio/wav"),
+    "mp3": ("MP3", "MPEG_LAYER_III", ".mp3", "audio/mpeg"),
+    "ogg": ("OGG", "OPUS", ".ogg", "audio/ogg"),
+}
+
+
+def content_type(fmt: str) -> str:
+    return FORMATS.get(fmt, FORMATS["flac"])[3]
+
+
 @dataclass
 class AudioSlice:
     path: Path
@@ -29,6 +46,7 @@ class AudioSlice:
     sample_rate: int
     channels: int
     segment_index: int | None
+    fmt: str = "flac"
 
 
 def _session_key(session: dict) -> bytes:
@@ -68,20 +86,28 @@ def _decoded_chunks(session: dict) -> Iterator[bytes]:
 
 
 def build_slice(session_id: str, out_dir: Path, segment_index: int | None = None,
-                start_ms: int = 0, end_ms: int | None = None) -> AudioSlice:
-    """Write one FLAC covering [start_ms, end_ms) of the session.
+                start_ms: int = 0, end_ms: int | None = None,
+                fmt: str = "flac") -> AudioSlice:
+    """Write one audio file covering [start_ms, end_ms) of the session.
 
-    FLAC is written rather than WAV because it is lossless and is on Mistral's
-    documented list of accepted formats, so the audio never has to be
-    transcoded on its way out.
+    FLAC by default: it is what the recorder produced, it is lossless, and it
+    is on Mistral's documented list, so nothing is transcoded on the way out.
+    A provider that will not take it (OurMind answers "invalid-format") gets
+    another container, decoded once and re-encoded here rather than stored
+    twice.
     """
+    if fmt not in FORMATS:
+        raise ApiError("INVALID_REQUEST", f"Onbekend audioformaat {fmt!r}")
+    sf_format, sf_subtype, extension, _ = FORMATS[fmt]
     session = sessions.get(session_id)
     if session is None:
         raise ApiError("UNKNOWN_SESSION", "Unknown session")
 
     out_dir.mkdir(parents=True, exist_ok=True)
     suffix = "full" if segment_index is None else f"seg{segment_index:02d}"
-    out_path = out_dir / f"{session_id}-{suffix}.flac"
+    # The extension matters: a provider that sniffs the file name rather than
+    # the bytes would otherwise be told the wrong thing.
+    out_path = out_dir / f"{session_id}-{suffix}{extension}"
 
     writer: sf.SoundFile | None = None
     rate = channels = 0
@@ -94,7 +120,7 @@ def build_slice(session_id: str, out_dir: Path, segment_index: int | None = None
                     rate, channels = handle.samplerate, handle.channels
                     writer = sf.SoundFile(
                         out_path, mode="w", samplerate=rate, channels=channels,
-                        format="FLAC", subtype="PCM_16",
+                        format=sf_format, subtype=sf_subtype,
                     )
                 elif handle.samplerate != rate or handle.channels != channels:
                     raise ApiError(
@@ -142,6 +168,7 @@ def build_slice(session_id: str, out_dir: Path, segment_index: int | None = None
         sample_rate=rate,
         channels=channels,
         segment_index=segment_index,
+        fmt=fmt,
     )
 
 

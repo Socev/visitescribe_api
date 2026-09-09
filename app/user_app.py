@@ -198,6 +198,7 @@ def create_user_app() -> FastAPI:
             "quota": quota,
             "email": user["email"],
             "org_name": user["org_name"],
+            "auto_allowed": settings.auto_process,
         }, _who(user)))
 
     @app.post("/instellingen")

@@ -53,6 +53,13 @@ class OurMindProvider:
         self.poll_seconds = float(os.environ.get("VS_OURMIND_POLL_SECONDS", "3"))
         self.poll_budget = float(os.environ.get("VS_OURMIND_POLL_BUDGET", "900"))
         self.language = os.environ.get("VS_OURMIND_LANGUAGE") or "nl-NL"
+        # What container to upload. OurMind refuses FLAC ("invalid-format")
+        # and documents nothing beyond `audio/*`, so rather than guess we try
+        # in order and remember what was accepted. After the first recording
+        # this costs nothing.
+        self.audio_formats = tuple(
+            f.strip() for f in (os.environ.get("VS_OURMIND_AUDIO_FORMATS")
+                                or "wav,mp3,ogg").split(",") if f.strip())
         self.template_id = os.environ.get("VS_OURMIND_TEMPLATE_ID") or ""
         self.delete_after = (os.environ.get("VS_OURMIND_DELETE_AFTER", "true") or "").lower() \
             in ("1", "true", "yes", "on")
@@ -65,6 +72,17 @@ class OurMindProvider:
         return (True, "")
 
     # -- who this token belongs to, and what it may use ------------------
+    def upload_formats(self) -> tuple[str, ...]:
+        """Preferred containers, best-known first.
+
+        Once a format has actually been accepted it goes to the front, so a
+        working installation stops experimenting.
+        """
+        known = accepted_audio_format()
+        if known and known in self.audio_formats:
+            return (known,) + tuple(f for f in self.audio_formats if f != known)
+        return self.audio_formats
+
     def me(self) -> dict[str, Any]:
         """The doctor behind this token: name, organisation, report quota.
 
@@ -142,7 +160,11 @@ class OurMindProvider:
         if response.status_code >= 500:
             raise ProviderError(f"OurMind serverfout {response.status_code}", retryable=True)
         if response.status_code >= 400:
-            raise ProviderError(_explain(response))
+            message = _explain(response)
+            # Their own machine-readable marker for "I cannot read this file".
+            if "invalid-format" in message or "format is not supported" in message:
+                raise ProviderError(message, code="UNSUPPORTED_AUDIO")
+            raise ProviderError(message)
         if response.status_code == 204 or not response.content:
             return None
         try:
@@ -182,10 +204,15 @@ class OurMindProvider:
             # sends a real Content-Length, so a 45-minute consultation never
             # sits in memory whole -- which is the entire point of the
             # streaming reassembly in app/audio.py, and would be undone here.
+            from .. import audio as audio_mod
+
+            fmt = context.get("audio_format") or "wav"
             with audio.open("rb") as handle:
                 self._call("PATCH", f"consultation/{consultation}/file/{file_id}",
-                           content=handle, content_type="audio/flac",
+                           content=handle,
+                           content_type=audio_mod.content_type(fmt),
                            timeout=max(self.timeout, 600))
+            remember_audio_format(fmt)
             self._call("POST", f"consultation/{consultation}/file/{file_id}/seal")
 
             transcript = self._await_transcript(consultation)
@@ -310,6 +337,22 @@ class OurMindProvider:
             self._call("DELETE", f"consultation/{consultation}")
         except ProviderError:
             pass
+
+
+AUDIO_FORMAT_KEY = "ourmind.audio_format"
+
+
+def accepted_audio_format() -> str:
+    from .. import db
+
+    return db.get_meta(AUDIO_FORMAT_KEY) or ""
+
+
+def remember_audio_format(fmt: str) -> None:
+    from .. import db
+
+    if fmt and db.get_meta(AUDIO_FORMAT_KEY) != fmt:
+        db.set_meta(AUDIO_FORMAT_KEY, fmt)
 
 
 def _id(payload: Any) -> str:

@@ -36,8 +36,15 @@ BACKOFF_SECONDS = (30, 120, 600, 1800)
 # ---------------------------------------------------------------------------
 
 def enqueue(session_id: str, route: str, *, actor: str = "admin",
-            force: bool = False) -> dict[str, Any]:
-    """Queue a confirmed session for processing on `route`."""
+            force: bool = False, template_id: str = "",
+            template_type: str = "") -> dict[str, Any]:
+    """Queue a confirmed session for processing on `route`.
+
+    `template_id` overrides the user's standing rule for this one run, which
+    is what the admin panel's picker sets. Kept on the session rather than in
+    a new column: it is a property of this queueing, not of the job rows, and
+    both jobs of a session share it.
+    """
     session = sessions.get(session_id)
     if session is None:
         raise ApiError("UNKNOWN_SESSION", "Unknown session")
@@ -79,7 +86,10 @@ def enqueue(session_id: str, route: str, *, actor: str = "admin",
     with db.tx() as conn:
         conn.execute(
             "UPDATE sessions SET processing_json = ?, updated_at = ? WHERE session_id = ?",
-            (json.dumps({"route": route, "queued_at": ts, "actor": actor}), ts, session_id),
+            (json.dumps({"route": route, "queued_at": ts, "actor": actor,
+                         "template_id": template_id,
+                         "template_type": template_type or "template"}),
+             ts, session_id),
         )
         for index in indices:
             cursor = conn.execute(
@@ -286,6 +296,14 @@ def run_job(job: dict[str, Any]) -> None:
         raise ProviderError(why, code="PROVIDER_NOT_CONFIGURED")
 
     rule = users.rule(owner["user_id"], session["mode"]) if owner else None
+    # A template chosen for this particular run wins over the standing rule.
+    try:
+        queued = json.loads(session["processing_json"] or "{}")
+    except (TypeError, ValueError):
+        queued = {}
+    template_id = queued.get("template_id") or (rule or {}).get("template_id") or ""
+    template_type = (queued.get("template_type") if queued.get("template_id")
+                     else (rule or {}).get("template_type")) or "template"
 
     segment_index = job["segment_index"]
     context = {
@@ -293,8 +311,8 @@ def run_job(job: dict[str, Any]) -> None:
         "client_status": session["client_status"],
         "segment_index": segment_index,
         "user_id": owner["user_id"] if owner else None,
-        "template_id": (rule or {}).get("template_id") or "",
-        "template_type": (rule or {}).get("template_type") or "template",
+        "template_id": template_id,
+        "template_type": template_type,
         "language": "nl",
         "privacy_gaps": bool(sessions.privacy_gaps(job["session_id"])),
     }
@@ -307,19 +325,52 @@ def run_job(job: dict[str, Any]) -> None:
         segments = sessions.patient_segments(job["session_id"])
         bounds = next((s for s in segments if s["index"] == segment_index), None)
         work = _work_dir(job["session_id"])
-        try:
+
+        def _slice(fmt: str):
             if segment_index is None or bounds is None:
-                sliced = audio_mod.build_slice(job["session_id"], work)
-            else:
-                sliced = audio_mod.build_slice(
-                    job["session_id"], work, segment_index=segment_index,
-                    start_ms=int(bounds["start_ms"]),
-                    end_ms=int(bounds["end_ms"]) if bounds["end_ms"] is not None else None,
-                )
-            context["audio_seconds"] = sliced.seconds
-            result = provider.transcribe(sliced.path, language="nl", context=context)
+                return audio_mod.build_slice(job["session_id"], work, fmt=fmt)
+            return audio_mod.build_slice(
+                job["session_id"], work, segment_index=segment_index,
+                start_ms=int(bounds["start_ms"]),
+                end_ms=int(bounds["end_ms"]) if bounds["end_ms"] is not None else None,
+                fmt=fmt,
+            )
+
+        # Which container to send. FLAC is what the recorder produced, but a
+        # provider may simply refuse it -- OurMind answers "invalid-format"
+        # and documents nothing beyond `audio/*`. So the provider names the
+        # containers it prefers and we work down the list, re-encoding from
+        # the stored chunks each time. The one that is accepted is remembered,
+        # so this costs a second upload once and never again.
+        formats = list(getattr(provider, "upload_formats", lambda: ("flac",))())
+        result = None
+        try:
+            for index, fmt in enumerate(formats):
+                sliced = _slice(fmt)
+                context["audio_seconds"] = sliced.seconds
+                context["audio_format"] = fmt
+                try:
+                    result = provider.transcribe(sliced.path, language="nl",
+                                                 context=context)
+                    break
+                except ProviderError as exc:
+                    if getattr(exc, "code", "") != "UNSUPPORTED_AUDIO" \
+                            or index == len(formats) - 1:
+                        raise
+                    log.info("%s refused %s (%s); trying %s",
+                             job["route"], fmt, exc, formats[index + 1])
+                    audit.log("processing", "audio_format_rejected", "retry",
+                              session_id=job["session_id"], identity="worker",
+                              detail={"provider": job["route"], "rejected": fmt,
+                                      "next": formats[index + 1]})
+                finally:
+                    sliced.path.unlink(missing_ok=True)
         finally:
             shutil.rmtree(work, ignore_errors=True)
+        if result is None:
+            raise ProviderError(
+                f"{job['route']} accepteerde geen van de formaten "
+                f"{', '.join(formats)}.", code="UNSUPPORTED_AUDIO")
 
         if result.usage.audio_seconds is None:
             result.usage.audio_seconds = context.get("audio_seconds")

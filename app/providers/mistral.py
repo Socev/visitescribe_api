@@ -61,6 +61,11 @@ class MistralProvider:
         self.note_model = os.environ.get("VS_MISTRAL_NOTE_MODEL") or DEFAULT_NOTE_MODEL
         self.timeout = float(os.environ.get("VS_MISTRAL_TIMEOUT", "900"))
 
+    def upload_formats(self) -> tuple[str, ...]:
+        """FLAC, and only FLAC: it is documented, lossless, and what the
+        recorder already produced, so nothing is transcoded on the way out."""
+        return ("flac",)
+
     def configured(self) -> tuple[bool, str]:
         if not self.api_key:
             return (False, "Geen Mistral API-sleutel ingesteld")

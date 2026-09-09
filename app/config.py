@@ -101,7 +101,6 @@ class Settings:
     processing_enabled: bool = field(default_factory=lambda: _b("VS_PROCESSING_ENABLED", True))
     processing_poll_seconds: float = field(
         default_factory=lambda: float(_i("VS_PROCESSING_POLL_SECONDS", 5)))
-    default_route: str = field(default_factory=lambda: _s("VS_DEFAULT_ROUTE", ""))
     # A kill switch, NOT the enable. Whether a recording is sent on by itself
     # is the user's own per-recording-type setting; this only exists so an
     # administrator can stop all outbound processing at once. Defaulting it to
