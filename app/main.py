@@ -17,6 +17,7 @@ import sys
 
 import uvicorn
 
+from . import processing
 from .admin_app import create_admin_app
 from .api_app import create_app
 from .bootstrap import initialise
@@ -89,6 +90,28 @@ def _mtls_server(app):
     )
 
 
+async def _worker_loop() -> None:
+    """Drains the processing queue.
+
+    Runs in this process but never on the request path: the jobs it picks up
+    are only ever created for sessions whose ingest is already confirmed, so a
+    slow provider cannot delay a recorder upload. Each job runs in a worker
+    thread because the provider calls and the audio reassembly are blocking.
+    """
+    if not settings.processing_enabled:
+        log.info("processing worker disabled (VS_PROCESSING_ENABLED)")
+        return
+    log.info("processing worker started")
+    idle = settings.processing_poll_seconds
+    while True:
+        try:
+            did_work = await asyncio.to_thread(processing.run_once)
+        except Exception:  # noqa: BLE001 - the loop must outlive one bad job
+            log.exception("processing worker error")
+            did_work = False
+        await asyncio.sleep(0 if did_work else idle)
+
+
 async def _run() -> None:
     api = create_app()
     admin = create_admin_app()
@@ -114,7 +137,12 @@ async def _run() -> None:
         except NotImplementedError:  # pragma: no cover - non-POSIX
             pass
 
-    await asyncio.gather(*(server.serve() for server in servers))
+    tasks = [asyncio.create_task(server.serve()) for server in servers]
+    worker = asyncio.create_task(_worker_loop())
+    try:
+        await asyncio.gather(*tasks)
+    finally:
+        worker.cancel()
 
 
 def main() -> int:

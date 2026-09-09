@@ -142,6 +142,7 @@ def layout(title: str, body: str, active: str = "", who: str = "") -> str:
         ("dashboard", "/admin/", "Overview"),
         ("sessions", "/admin/sessions", "Sessions"),
         ("devices", "/admin/devices", "Devices"),
+        ("costs", "/admin/costs", "Verwerking"),
         ("keys", "/admin/keys", "Keys"),
         ("audit", "/admin/audit", "Audit"),
     ]
@@ -428,12 +429,8 @@ missing data.</p><div class="scroll"><table><thead><tr><th>From</th><th>To</th>
         f'<option value="{_e(x)}"{" selected" if x == s["state"] else ""}>{_e(x)}</option>'
         for x in d["states"] if x != "PURGED"
     )
-    route = (d["processing"] or {}).get("route") or ""
-    route_options = "".join(
-        f'<option value="{_e(x)}"{" selected" if x == route else ""}>{_e(x or "not routed")}</option>'
-        for x in ("", "local", "ourmind", "plaud")
-    )
     audit_rows = _audit_rows(d["audit"])
+    processing_block = _processing_panel(d)
 
     body = f"""<p><a href="/admin/sessions">← Sessions</a></p>
 <h1 class="mono">{_e(sid)}</h1>
@@ -466,8 +463,6 @@ missing data.</p><div class="scroll"><table><thead><tr><th>From</th><th>To</th>
 <div class="row">
 <div><label>State</label><select id="st">{state_options}</select></div>
 <div class="narrow"><button onclick="setState()">Apply state</button></div>
-<div><label>Processing route</label><select id="rt">{route_options}</select></div>
-<div class="narrow"><button onclick="setRoute()">Set route</button></div>
 <div class="narrow"><a class="btn" href="/admin/api/sessions/{_e(sid)}/export.zip">
 Export .zip</a></div>
 <div class="narrow"><a class="btn" href="/admin/api/sessions/{_e(sid)}/audio.wav">
@@ -489,6 +484,7 @@ Segments are never combined into one note.</p>
 <div class="scroll"><table><thead><tr><th class="right">#</th><th>From</th><th>To</th>
 <th>Duration</th></tr></thead><tbody>{segments}</tbody></table></div></div></div>
 {gaps_block}
+{processing_block}
 <h2>Audit trail</h2><div class="panel"><div class="scroll"><table><thead><tr>
 <th>Time</th><th>Category</th><th>Action</th><th>Outcome</th><th>Detail</th>
 </tr></thead><tbody>{audit_rows}</tbody></table></div></div>
@@ -497,8 +493,6 @@ const SID={json.dumps(sid)};
 async function setState(){{ await act('/admin/api/sessions/'+SID+'/state',
   {{state:document.getElementById('st').value}}); toast('State updated','ok');
   setTimeout(()=>location.reload(),600); }}
-async function setRoute(){{ await act('/admin/api/sessions/'+SID+'/processing',
-  {{route:document.getElementById('rt').value}}); toast('Route updated','ok'); }}
 async function purge(scope){{
   if(!confirm('Purge '+scope+' for this session? Stored audio is deleted permanently.')) return;
   await act('/admin/api/sessions/'+SID+'/purge',{{scope:scope}});
@@ -792,3 +786,256 @@ def _audit_full_rows(rows: list[dict[str, Any]]) -> str:
 <td class="mono muted" style="max-width:420px;word-break:break-word">{_e(detail)}</td></tr>"""
         )
     return "".join(out)
+
+
+# ---------------------------------------------------------------------------
+# processing
+# ---------------------------------------------------------------------------
+
+_JOB_CHIP = {
+    "done": "ok", "running": "info", "queued": "warn",
+    "failed": "bad", "cancelled": "",
+}
+
+
+def _money(value: Any) -> str:
+    if value is None:
+        return "—"
+    try:
+        amount = float(value)
+    except (TypeError, ValueError):
+        return "—"
+    if amount == 0:
+        return "$0.00"
+    if amount < 0.01:
+        return f"${amount:.4f}"
+    return f"${amount:.2f}"
+
+
+def _duration(seconds: Any) -> str:
+    """Audio totals read better in the unit a person would use."""
+    try:
+        total = float(seconds or 0)
+    except (TypeError, ValueError):
+        return "—"
+    if total < 90:
+        return f"{total:.0f} sec"
+    if total < 5400:
+        return f"{total / 60:.0f} min"
+    return f"{total / 3600:.1f} uur"
+
+
+def _processing_panel(d: dict[str, Any]) -> str:
+    sid = d["session"]["session_id"]
+    results = d.get("results") or {}
+    allowed = d.get("allowed_routes") or []
+    jobs = results.get("jobs") or []
+    transcripts = results.get("transcripts") or []
+    notes = results.get("notes") or []
+    usage = results.get("usage") or []
+
+    if not allowed:
+        controls = ('<p class="muted">Voor deze opnamemodus is geen verwerkingsroute '
+                    'toegestaan.</p>')
+    else:
+        options = "".join(f'<option value="{_e(r)}">{_e(r)}</option>' for r in allowed)
+        controls = f"""<div class="row">
+<div><label>Route</label><select id="route">{options}</select></div>
+<div class="narrow"><button class="primary" onclick="startProcessing()">Verwerken</button></div>
+<div class="narrow"><button onclick="cancelProcessing()">Annuleren</button></div>
+</div>
+<p class="muted" style="margin:10px 0 0">Toegestaan voor
+<span class="mono">{_e(d['session']['mode'])}</span>:
+<strong>{_e(', '.join(allowed))}</strong> — afgeleid uit wat de recorder heeft
+opgenomen, niet uit wie de route kiest.</p>"""
+
+    if jobs:
+        rows = "".join(
+            f"""<tr><td>{_e(j['stage'])}</td>
+<td>{_e(j['segment_index'] if j['segment_index'] is not None else 'hele sessie')}</td>
+<td>{_e(j['route'])}</td>
+<td><span class="chip {_JOB_CHIP.get(j['state'], '')}">{_e(j['state'])}</span></td>
+<td class="right">{j['attempts']}</td>
+<td class="mono muted" style="max-width:380px;word-break:break-word">{_e(j['error'] or '')}</td>
+</tr>""" for j in jobs)
+        jobs_block = f"""<h3>Wachtrij</h3><div class="scroll"><table><thead><tr>
+<th>Stap</th><th>Segment</th><th>Route</th><th>Status</th><th class="right">Pogingen</th>
+<th>Fout</th></tr></thead><tbody>{rows}</tbody></table></div>"""
+    else:
+        jobs_block = ""
+
+    total = sum(u["cost_usd"] or 0 for u in usage)
+    unpriced = sum(1 for u in usage if not u["priced"])
+    if usage:
+        urows = "".join(
+            f"""<tr><td>{_e(u['operation'])}</td><td class="mono">{_e(u['model'] or '')}</td>
+<td class="num">{_e(f"{u['audio_seconds']:.1f}" if u['audio_seconds'] else '—')}</td>
+<td class="num">{_e(u['total_tokens'] if u['total_tokens'] else '—')}</td>
+<td class="num">{_e(_money(u['cost_usd']) if u['priced'] else 'onbekend')}</td>
+</tr>""" for u in usage)
+        cost_block = f"""<h3>Verbruik en kosten</h3><div class="scroll"><table><thead><tr>
+<th>Stap</th><th>Model</th><th class="right">Audio (s)</th><th class="right">Tokens</th>
+<th class="right">Kosten</th></tr></thead><tbody>{urows}</tbody></table></div>
+<p class="muted" style="margin:10px 0 0">Totaal <strong>{_money(total)}</strong>
+{f' · {unpriced} call(s) zonder bekend tarief' if unpriced else ''}</p>"""
+    else:
+        cost_block = ""
+
+    pairs = []
+    by_index = {t["segment_index"]: t for t in transcripts}
+    for note in notes or [{"segment_index": t["segment_index"]} for t in transcripts]:
+        index = note.get("segment_index")
+        transcript = by_index.get(index, {})
+        label = "Hele sessie" if index is None else f"Patiëntsegment {index}"
+        key = "full" if index is None else str(index)
+        status = note.get("status")
+        chip = ('<span class="chip ok">goedgekeurd</span>' if status == "approved"
+                else '<span class="chip warn">concept</span>' if status else "")
+        pairs.append(f"""<div class="panel">
+<div class="row" style="align-items:baseline">
+<div><h3 style="margin:0">{_e(label)} {chip}</h3></div>
+<div class="narrow muted" style="font-size:13px">{_e(note.get('model') or '')}</div>
+</div>
+<div class="grid g2" style="margin-top:14px">
+<div><label>Transcript</label>
+<pre style="max-height:340px;overflow:auto;white-space:pre-wrap">{_e(transcript.get('text') or '—')}</pre></div>
+<div><label>Concept-verslag</label>
+<textarea id="note-{_e(key)}" rows="14" style="font-family:inherit">{_e(note.get('body') or '')}</textarea>
+<div class="row" style="margin-top:10px">
+<div class="narrow"><button class="primary" onclick="saveNote('{_e(key)}', true)">Opslaan en goedkeuren</button></div>
+<div class="narrow"><button onclick="saveNote('{_e(key)}', false)">Alleen opslaan</button></div>
+</div></div></div></div>""")
+    review = ("<h2>Transcript en verslag</h2>" + "".join(pairs)) if pairs else ""
+
+    return f"""<h2>Verwerking</h2>
+<div class="panel">{controls}{jobs_block}{cost_block}</div>
+{review}
+<script>
+async function startProcessing(){{
+  await act('/admin/api/sessions/'+SID+'/processing',
+    {{route: document.getElementById('route').value}});
+  toast('In de wachtrij gezet','ok'); setTimeout(()=>location.reload(), 900);
+}}
+async function cancelProcessing(){{
+  await act('/admin/api/sessions/'+SID+'/processing/cancel', {{}});
+  toast('Geannuleerd','ok'); setTimeout(()=>location.reload(), 700);
+}}
+async function saveNote(key, approve){{
+  const body = document.getElementById('note-'+key).value;
+  await act('/admin/api/sessions/'+SID+'/notes/'+key+'/approve',
+    {{body: body, status: approve ? 'approved' : 'draft'}});
+  toast(approve ? 'Goedgekeurd' : 'Opgeslagen','ok');
+  setTimeout(()=>location.reload(), 700);
+}}
+</script>"""
+
+
+def render_costs(d: dict[str, Any], who: str) -> str:
+    lines = d["costs"]["lines"]
+    rows = "".join(
+        f"""<tr><td class="name">{_e(l['provider'])}</td><td>{_e(l['operation'])}</td>
+<td class="num">{l['calls']}</td>
+<td class="num">{_e(f"{l['audio_seconds']/60:.1f}" if l['audio_seconds'] else '—')}</td>
+<td class="num">{_e(l['tokens'] or '—')}</td>
+<td class="num">{_money(l['cost_usd'])}</td>
+<td class="num">{_e(l['unpriced'] or 0)}</td></tr>""" for l in lines
+    ) or '<tr><td colspan="7" class="muted">Nog niets verwerkt.</td></tr>'
+
+    policy = "".join(
+        f"""<tr><td class="mono">{_e(p['mode'])}</td>
+<td>{' '.join(f'<span class="chip ok">{_e(x)}</span>' for x in p['allowed'])}</td></tr>"""
+        for p in d["policy"])
+
+    providers = "".join(
+        f"""<tr><td class="name">{_e(p['provider'])}</td>
+<td>{'<span class="chip ok">ingesteld</span>' if p['configured'] else '<span class="chip warn">ontbreekt</span>'}</td>
+<td class="muted">{_e(p['kind'] or '—')}</td>
+<td class="muted">{_e(p['source'] or '—')}</td>
+<td class="mono muted">{_e(p['hint'] or '')}</td></tr>""" for p in d["providers"])
+
+    queue = " ".join(
+        f'<span class="chip">{_e(k)} · {v}</span>' for k, v in sorted(d["queue"].items())
+    ) or '<span class="muted">wachtrij leeg</span>'
+
+    unpriced_note = (
+        f'<div class="banner warn">{d["costs"]["unpriced_calls"]} call(s) hadden geen '
+        f'bekend tarief en tellen niet mee in het totaal. Een onbekend bedrag mag niet '
+        f'als gratis in de boeken komen.</div>'
+        if d["costs"]["unpriced_calls"] else "")
+
+    body = f"""<h1>Verwerking</h1>
+<p class="sub">Wat er verwerkt is, wat het kostte, en welke routes zijn toegestaan.</p>
+{unpriced_note}
+<div class="grid g4">
+  <div class="stat"><div class="k">Kosten totaal</div>
+    <div class="v">{_money(d['costs']['total_cost_usd'])}</div>
+    <div class="n">alle verwerkte sessies</div></div>
+  <div class="stat"><div class="k">Audio verwerkt</div>
+    <div class="v">{_duration(d['costs'].get('total_audio_seconds'))}</div>
+    <div class="n">over alle providers</div></div>
+  <div class="stat"><div class="k">Wachtrij</div><div class="v">{sum(d['queue'].values())}</div>
+    <div class="n">{'worker actief' if d['enabled'] else 'worker uitgeschakeld'}</div></div>
+  <div class="stat"><div class="k">Zonder tarief</div>
+    <div class="v">{d['costs']['unpriced_calls']}</div>
+    <div class="n">handmatig na te rekenen</div></div>
+</div>
+<div class="panel"><h3 style="margin-top:0">Wachtrij</h3>{queue}</div>
+<h2>Kosten per provider</h2>
+<div class="panel"><div class="scroll"><table><thead><tr>
+<th>Provider</th><th>Stap</th><th class="right">Calls</th><th class="right">Audio (min)</th>
+<th class="right">Tokens</th><th class="right">Kosten</th><th class="right">Zonder tarief</th>
+</tr></thead><tbody>{rows}</tbody></table></div>
+<p class="muted" style="margin:12px 0 0">OurMind valt binnen je abonnement en wordt
+daarom als $0,00 geboekt; het verbruik telt daar in rapporten per maand, niet in
+minuten. Mistral rekent per minuut audio, en dat aantal komt uit het antwoord van de
+API zelf — niet uit een schatting.</p></div>
+<h2>Toegestane routes</h2>
+<div class="panel"><p class="muted" style="margin-top:0">Afgeleid uit de opnamemodus
+die de recorder meestuurt. De controle draait bij het inplannen én opnieuw in de
+worker, vlak voordat er audio het pand verlaat.</p>
+<div class="scroll"><table><thead><tr><th>Opnamemodus</th><th>Toegestane routes</th>
+</tr></thead><tbody>{policy}</tbody></table></div></div>
+<h2>Providers</h2>
+<div class="panel"><div class="scroll"><table><thead><tr>
+<th>Provider</th><th>Status</th><th>Soort</th><th>Bron</th><th>Begin</th>
+</tr></thead><tbody>{providers}</tbody></table></div>
+<h3>Sleutel of token opslaan</h3>
+<div class="row">
+<div><label>Provider</label><select id="cp">
+<option value="mistral">mistral (API-sleutel)</option>
+<option value="ourmind">ourmind (bearer-token)</option></select></div>
+<div><label>Waarde</label><input id="cs" type="password"
+ placeholder="wordt opgeslagen, nooit teruggetoond"></div>
+<div class="narrow"><button class="primary" onclick="saveCred()">Opslaan</button></div>
+<div class="narrow"><button class="danger" onclick="dropCred()">Verwijderen</button></div>
+</div>
+<p class="muted" style="margin:10px 0 0">OurMind kent alleen een niet-interactieve
+inlog voor benoemde partners. Voor ons betekent dat: inloggen met de e-mailcode en
+het verkregen token hier plakken, tot OurMind een integratietoken uitgeeft.</p>
+<p style="margin:10px 0 0"><button onclick="checkQuota()">Verbruik bij OurMind opvragen</button>
+<span id="quota" class="muted"></span></p></div>
+<script>
+async function saveCred(){{
+  const p=document.getElementById('cp').value;
+  const v=document.getElementById('cs').value;
+  if(!v){{toast('Geen waarde ingevuld','bad');return;}}
+  await act('/admin/api/providers/'+p+'/credential', {{secret:v}});
+  document.getElementById('cs').value='';
+  toast('Opgeslagen','ok'); setTimeout(()=>location.reload(), 700);
+}}
+async function dropCred(){{
+  const p=document.getElementById('cp').value;
+  if(!confirm('Sleutel voor '+p+' verwijderen?'))return;
+  await act('/admin/api/providers/'+p+'/credential', {{remove:true}});
+  toast('Verwijderd','ok'); setTimeout(()=>location.reload(), 700);
+}}
+async function checkQuota(){{
+  try{{
+    const r = await api('/admin/api/providers/ourmind/quota');
+    document.getElementById('quota').textContent =
+      ' ' + (r.reports_used ?? '?') + ' van ' + (r.monthly_reports ?? '?') +
+      ' rapporten gebruikt (plan ' + (r.plan ?? '?') + ')';
+  }}catch(e){{ toast(e.message,'bad'); }}
+}}
+</script>"""
+    return layout("Verwerking", body, "costs", who)

@@ -95,6 +95,13 @@ class Settings:
     retention_source_audio_days: int = field(default_factory=lambda: _i("VS_RETENTION_SOURCE_AUDIO_DAYS", 0))
     retention_audit_days: int = field(default_factory=lambda: _i("VS_RETENTION_AUDIT_DAYS", 0))
 
+    # --- processing ------------------------------------------------------
+    processing_enabled: bool = field(default_factory=lambda: _b("VS_PROCESSING_ENABLED", True))
+    processing_poll_seconds: float = field(
+        default_factory=lambda: float(_i("VS_PROCESSING_POLL_SECONDS", 5)))
+    default_route: str = field(default_factory=lambda: _s("VS_DEFAULT_ROUTE", ""))
+    auto_process: bool = field(default_factory=lambda: _b("VS_AUTO_PROCESS", False))
+
     public_base_url: str = field(default_factory=lambda: _s("VS_PUBLIC_BASE_URL", ""))
     log_level: str = field(default_factory=lambda: _s("VS_LOG_LEVEL", "info"))
 

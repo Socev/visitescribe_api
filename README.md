@@ -204,6 +204,68 @@ changes that if a later processing stage needs it.
 
 ---
 
+## Processing
+
+A session that reaches `INGESTED` can be handed to a provider. This runs in the
+same pod but in its own worker loop, off the request path: nothing in it can
+delay a recorder upload, and the queue lives in the database, so a restart
+mid-transcription resumes rather than losing the session.
+
+### Which provider a recording may reach
+
+The recorder already states what kind of recording it made, so the policy is
+derived from `mode` rather than trusted to whoever picks the route:
+
+| `mode` | allowed |
+|---|---|
+| `single_patient` | `mistral`, `ourmind` |
+| `multi_patient` | `mistral`, `ourmind` |
+| `meeting` | `mistral` |
+
+The check runs when the job is queued **and again in the worker**, immediately
+before any audio leaves the machine. A route that was retired — `plaud`,
+`local` — answers with the reason it was retired rather than "unknown".
+
+A `multi_patient` recording is split on the `patient_boundary` offsets the
+recorder reported: one job, one transcript and one note per segment. Segments
+are never merged.
+
+### Providers
+
+**Mistral** — `voxtral-mini-2602` for transcription, a chat model for the note.
+FLAC is on Mistral's documented list of accepted formats, so the stored audio
+goes out exactly as it was recorded: no transcode, no quality loss, no extra
+failure mode. Diarization is on; note that Mistral documents
+`timestamp_granularities` as incompatible with `language`, and this picks
+`language` — for a known-Dutch consultation that is worth more than segment
+timings. The model id is pinned rather than `-latest`: the previous Voxtral
+transcription model was retired with about three months' notice, and a medical
+pipeline should not swap models underneath itself.
+
+**OurMind** — produces the SOEP report and ICPC-NHG-24 codes itself, so there is
+no prompt of ours in that path. One consultation carries at most one patient,
+which lines up exactly with our patient segments. The only non-interactive login
+OurMind documents is for named partners, each with an integration token issued
+by OurMind; everyone else signs in with an emailed one-time code. So this
+provider does not log in — it uses whatever token is in the credential store and
+says so plainly when there is none.
+
+### Cost tracking
+
+Every provider call is recorded with what it consumed, whether or not a price is
+known for it. Rates live in `app/pricing.py` with the source and the date each
+was read, and `VS_PRICE_OVERRIDES` can override one without a redeploy.
+
+An unpriced call is stored with `priced = 0` and a reason, and the admin totals
+count it separately — **an unknown cost is never folded in as zero**. OurMind is
+priced at zero deliberately, because it is included in the subscription and
+counted there in reports per month rather than in minutes; its consumption is
+read from the provider instead, via `GET /me`.
+
+Mistral's own response reports `prompt_audio_seconds`, so the billed quantity is
+the provider's number rather than our estimate. At $0.003 per minute a
+twenty-minute consultation costs six cents to transcribe.
+
 ## Admin interface
 
 At `/admin/` on port 8081:
@@ -219,6 +281,8 @@ At `/admin/` on port 8081:
   fingerprints, enable/disable, pause uploads, open enrolment windows, edit the
   configuration returned by `/v1/device/config`.
 - **Keys** — view and copy public keys, rotate.
+- **Verwerking** — spend per provider, the queue, the routing policy, and where
+  provider keys are stored (never shown again once saved).
 - **Audit** — everything, filterable by category, outcome, device or session.
 
 Set `VS_ADMIN_PASSWORD` for a password on top of the Olares sign-in. Without it
@@ -277,6 +341,17 @@ purge happened is always retained.**
 | `VS_RATE_LIMIT_BURST` | `240` | its burst allowance |
 | `VS_DEFAULT_CHUNK_SECONDS` | `30` | advertised in `/v1/device/config` |
 | `VS_DEFAULT_MIN_BATTERY` | `15` | advertised in `/v1/device/config` |
+| `VS_PROCESSING_ENABLED` | `true` | run the processing worker in this pod |
+| `VS_PROCESSING_POLL_SECONDS` | `5` | how often an idle worker looks for work |
+| `VS_MISTRAL_API_KEY` | *(empty)* | fallback when no key is stored in the admin |
+| `VS_MISTRAL_ASR_MODEL` | `voxtral-mini-2602` | pinned, never `-latest` |
+| `VS_MISTRAL_NOTE_MODEL` | `mistral-medium-3.5` | model that writes the note |
+| `VS_MISTRAL_EU_ENDPOINT` | `false` | use `api.eu.mistral.ai` (+10%, no Files API or batch) |
+| `VS_OURMIND_BASE_URL` | `https://api.ourmind.ai` | |
+| `VS_OURMIND_API_VERSION` | `2025-05-07` | dated API version, in the path |
+| `VS_OURMIND_TEMPLATE_ID` | *(empty)* | note template; account default when empty |
+| `VS_OURMIND_DELETE_AFTER` | `true` | delete the consultation once the note is in |
+| `VS_PRICE_OVERRIDES` | *(empty)* | JSON, e.g. `{"mistral:voxtral-mini-2602:audio_minute":0.0025}` |
 | `VS_LOG_LEVEL` | `info` | |
 
 ---
@@ -319,7 +394,7 @@ pip install -r requirements-dev.txt
 pytest tests/ -q
 ```
 
-89 tests covering the complete 20-step acceptance flow from the specification,
+111 tests covering the complete 20-step acceptance flow from the specification,
 every listed negative case (wrong device, wrong certificate identity, bad key
 wrap, wrong nonce, wrong AAD, wrong ciphertext hash, wrong plaintext hash, GCM
 authentication failure, invalid FLAC, chunk not in manifest, duplicate chunk with
@@ -329,7 +404,11 @@ rotation across a live session, and the admin interface — plus regression test
 for every issue found in review: FLAC decompression bombs, unbounded chunked
 request bodies, GCM nonce reuse, non-ASCII AAD handling, paused uploads,
 `ingest_confirmed` surviving a purge, and out-of-range patient boundaries
-producing inverted segments.
+producing inverted segments. The processing layer adds its own: the routing
+policy is tested from both ends (a meeting cannot reach OurMind, and a job whose
+route is tampered with is refused by the worker before anything leaves), audio
+slicing is checked against the reported segment boundaries, and an unpriced call
+is asserted never to be counted as free.
 
 ## Licence
 

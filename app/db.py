@@ -187,6 +187,90 @@ CREATE TABLE IF NOT EXISTS purges (
     detail_json TEXT NOT NULL DEFAULT '{}'
 );
 
+-- Processing layer -------------------------------------------------------
+CREATE TABLE IF NOT EXISTS processing_jobs (
+    id             INTEGER PRIMARY KEY AUTOINCREMENT,
+    session_id     TEXT NOT NULL,
+    segment_index  INTEGER,            -- NULL = the whole session
+    route          TEXT NOT NULL,      -- mistral | ourmind
+    stage          TEXT NOT NULL,      -- transcribe | note
+    state          TEXT NOT NULL,      -- queued | running | done | failed | cancelled
+    attempts       INTEGER NOT NULL DEFAULT 0,
+    next_attempt_at TEXT,
+    error_code     TEXT,
+    error          TEXT,
+    detail_json    TEXT NOT NULL DEFAULT '{}',
+    created_at     TEXT NOT NULL,
+    updated_at     TEXT NOT NULL,
+    started_at     TEXT,
+    finished_at    TEXT
+);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_jobs_unique
+    ON processing_jobs(session_id, IFNULL(segment_index, -1), stage);
+CREATE INDEX IF NOT EXISTS idx_jobs_ready ON processing_jobs(state, next_attempt_at);
+
+CREATE TABLE IF NOT EXISTS transcripts (
+    id            INTEGER PRIMARY KEY AUTOINCREMENT,
+    session_id    TEXT NOT NULL,
+    segment_index INTEGER,
+    provider      TEXT NOT NULL,
+    model         TEXT,
+    language      TEXT,
+    text          TEXT NOT NULL,
+    segments_json TEXT NOT NULL DEFAULT '[]',
+    audio_seconds REAL,
+    created_at    TEXT NOT NULL
+);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_transcripts_unique
+    ON transcripts(session_id, IFNULL(segment_index, -1));
+
+CREATE TABLE IF NOT EXISTS notes (
+    id            INTEGER PRIMARY KEY AUTOINCREMENT,
+    session_id    TEXT NOT NULL,
+    segment_index INTEGER,
+    provider      TEXT NOT NULL,
+    model         TEXT,
+    template      TEXT,
+    title         TEXT,
+    body          TEXT NOT NULL,
+    codes_json    TEXT NOT NULL DEFAULT '[]',
+    status        TEXT NOT NULL DEFAULT 'draft',   -- draft | approved
+    created_at    TEXT NOT NULL,
+    updated_at    TEXT NOT NULL
+);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_notes_unique
+    ON notes(session_id, IFNULL(segment_index, -1));
+
+-- Every billable call is recorded here, whether or not a price is known.
+CREATE TABLE IF NOT EXISTS usage_records (
+    id                INTEGER PRIMARY KEY AUTOINCREMENT,
+    session_id        TEXT,
+    segment_index     INTEGER,
+    provider          TEXT NOT NULL,
+    model             TEXT,
+    operation         TEXT NOT NULL,   -- transcribe | note
+    audio_seconds     REAL,
+    prompt_tokens     INTEGER,
+    completion_tokens INTEGER,
+    total_tokens      INTEGER,
+    cost_usd          REAL,
+    priced            INTEGER NOT NULL DEFAULT 0,
+    price_note        TEXT,
+    raw_usage_json    TEXT NOT NULL DEFAULT '{}',
+    created_at        TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_usage_session ON usage_records(session_id);
+CREATE INDEX IF NOT EXISTS idx_usage_created ON usage_records(created_at);
+
+CREATE TABLE IF NOT EXISTS provider_credentials (
+    provider   TEXT PRIMARY KEY,
+    kind       TEXT NOT NULL,          -- api_key | bearer
+    secret     TEXT NOT NULL,
+    meta_json  TEXT NOT NULL DEFAULT '{}',
+    expires_at TEXT,
+    updated_at TEXT NOT NULL
+);
+
 CREATE TABLE IF NOT EXISTS admin_sessions (
     token_hash TEXT PRIMARY KEY,
     created_at TEXT NOT NULL,

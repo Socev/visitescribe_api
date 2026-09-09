@@ -16,9 +16,13 @@ from contextlib import asynccontextmanager
 from fastapi import FastAPI, Request, Response
 from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse, StreamingResponse
 
-from . import __version__, adminauth, audit, crypto, db, flacinfo, sessions, storage
+from . import (__version__, adminauth, audit, crypto, db, flacinfo, pricing,
+               processing, routing, sessions, storage)
+from .providers import credentials as provider_credentials
+from .providers import get as get_provider
 from .admin_html import (
     render_audit,
+    render_costs,
     render_dashboard,
     render_device_detail,
     render_devices,
@@ -172,6 +176,19 @@ def create_admin_app() -> FastAPI:
             return who
         return HTMLResponse(render_keys(crypto.all_keys(), who))
 
+    @app.get("/admin/costs", response_class=HTMLResponse, include_in_schema=False)
+    async def costs_page(request: Request):  # noqa: ANN202
+        who = html_guard(request)
+        if isinstance(who, RedirectResponse):
+            return who
+        return HTMLResponse(render_costs({
+            "costs": processing.cost_summary(),
+            "queue": processing.queue_overview(),
+            "policy": routing.describe(),
+            "providers": provider_credentials.status(),
+            "enabled": settings.processing_enabled,
+        }, who))
+
     @app.get("/admin/audit", response_class=HTMLResponse, include_in_schema=False)
     async def audit_page(request: Request, category: str = "", outcome: str = "",
                          device_id: str = "", session_id: str = "", q: str = "",
@@ -225,27 +242,108 @@ def create_admin_app() -> FastAPI:
         return JSONResponse(sessions.status_payload(session_id))
 
     @app.post("/admin/api/sessions/{session_id}/processing", include_in_schema=False)
-    async def api_set_processing(session_id: str, request: Request) -> JSONResponse:  # noqa: ANN202
+    async def api_process(session_id: str, request: Request) -> JSONResponse:  # noqa: ANN202
+        """Queue a session for processing on a route the policy allows."""
         who = guard(request)
         body = await _body(request)
         route = str(body.get("route") or "").strip().lower()
-        if route not in ("", "local", "ourmind", "plaud"):
-            raise ApiError("INVALID_REQUEST", "route must be local, ourmind or plaud")
-        session = sessions.get(session_id)
-        if session is None:
+        result = processing.enqueue(session_id, route, actor=who,
+                                    force=bool(body.get("force")))
+        return JSONResponse(result)
+
+    @app.post("/admin/api/sessions/{session_id}/processing/cancel",
+              include_in_schema=False)
+    async def api_process_cancel(session_id: str, request: Request) -> JSONResponse:  # noqa: ANN202
+        who = guard(request)
+        return JSONResponse({"cancelled": processing.cancel(session_id, actor=who)})
+
+    @app.get("/admin/api/sessions/{session_id}/results", include_in_schema=False)
+    async def api_results(session_id: str, request: Request) -> JSONResponse:  # noqa: ANN202
+        guard(request)
+        if sessions.get(session_id) is None:
             raise ApiError("UNKNOWN_SESSION", "Unknown session")
-        processing = {
-            "route": route or None,
-            "transcription_provider": body.get("transcription_provider") or route or None,
-            "document_provider": body.get("document_provider") or route or None,
-        }
-        db.execute(
-            "UPDATE sessions SET processing_json = ?, updated_at = ? WHERE session_id = ?",
-            (json.dumps(processing), now_iso(), session_id),
+        return JSONResponse(processing.results_for(session_id))
+
+    @app.post("/admin/api/sessions/{session_id}/notes/{segment}/approve",
+              include_in_schema=False)
+    async def api_approve_note(session_id: str, segment: str,
+                               request: Request) -> JSONResponse:  # noqa: ANN202
+        who = guard(request)
+        body = await _body(request)
+        index = None if segment in ("-", "full") else int(segment)
+        updates = ["status = ?", "updated_at = ?"]
+        params: list[Any] = [str(body.get("status") or "approved"), now_iso()]
+        if "body" in body:
+            updates.insert(0, "body = ?")
+            params.insert(0, str(body["body"]))
+        params.extend([session_id, index])
+        cursor = db.execute(
+            f"UPDATE notes SET {', '.join(updates)} WHERE session_id = ? "
+            f"AND IFNULL(segment_index, -1) = IFNULL(?, -1)", tuple(params))
+        if not cursor.rowcount:
+            raise ApiError("UNKNOWN_SESSION", "Geen verslag voor dit segment")
+        audit.log("processing", "note_reviewed", "success", session_id=session_id,
+                  identity=who, detail={"segment": index,
+                                        "edited": "body" in body,
+                                        "status": params[0] if "body" in body else params[0]})
+        if sessions.get(session_id) and not db.query_one(
+            "SELECT 1 FROM notes WHERE session_id = ? AND status != 'approved'",
+            (session_id,)
+        ):
+            sessions.set_state(session_id, "APPROVED", ingest_confirmed=True, actor=who)
+        return JSONResponse(processing.results_for(session_id))
+
+    @app.get("/admin/api/processing", include_in_schema=False)
+    async def api_processing_overview(request: Request) -> JSONResponse:  # noqa: ANN202
+        guard(request)
+        return JSONResponse({
+            "queue": processing.queue_overview(),
+            "policy": routing.describe(),
+            "providers": provider_credentials.status(),
+            "prices": pricing.known_models(),
+            "enabled": settings.processing_enabled,
+        })
+
+    @app.get("/admin/api/costs", include_in_schema=False)
+    async def api_costs(request: Request, since: str = "") -> JSONResponse:  # noqa: ANN202
+        guard(request)
+        return JSONResponse(processing.cost_summary(since or None))
+
+    @app.post("/admin/api/providers/{provider}/credential", include_in_schema=False)
+    async def api_set_credential(provider: str, request: Request) -> JSONResponse:  # noqa: ANN202
+        who = guard(request)
+        if provider not in routing.PROVIDERS:
+            raise ApiError("INVALID_REQUEST", f"Onbekende provider {provider!r}")
+        body = await _body(request)
+        if body.get("remove"):
+            provider_credentials.forget(provider)
+            audit.log("provider", "credential_removed", "success", identity=who,
+                      detail={"provider": provider})
+            return JSONResponse({"provider": provider, "configured": False})
+        secret = str(body.get("secret") or "").strip()
+        if not secret:
+            raise ApiError("INVALID_REQUEST", "Geen sleutel of token opgegeven")
+        provider_credentials.store(
+            provider, secret,
+            kind=str(body.get("kind") or ("bearer" if provider == "ourmind" else "api_key")),
+            meta={"source": "admin", "set_by": who},
+            expires_at=body.get("expires_at"),
         )
-        audit.log("processing", "route_set", "success", session_id=session_id,
-                  device_id=session["device_id"], identity=who, detail=processing)
-        return JSONResponse({"session_id": session_id, "processing": processing})
+        # Never logged, never echoed back — only that one was set.
+        audit.log("provider", "credential_set", "success", identity=who,
+                  detail={"provider": provider})
+        return JSONResponse({"provider": provider, "configured": True})
+
+    @app.get("/admin/api/providers/{provider}/quota", include_in_schema=False)
+    async def api_provider_quota(provider: str, request: Request) -> JSONResponse:  # noqa: ANN202
+        guard(request)
+        instance = get_provider(provider)
+        ready, why = instance.configured()
+        if not ready:
+            raise ApiError("PROVIDER_NOT_CONFIGURED", why)
+        if not hasattr(instance, "quota"):
+            raise ApiError("INVALID_REQUEST", "Deze provider rapporteert geen verbruik")
+        return JSONResponse(instance.quota())
 
     @app.post("/admin/api/sessions/{session_id}/purge", include_in_schema=False)
     async def api_purge(session_id: str, request: Request) -> JSONResponse:  # noqa: ANN202
@@ -540,6 +638,10 @@ def _dashboard_data() -> dict[str, Any]:
         "integrity_failures": failures,
         "security_failures": security,
         "flac_decoder": "libsndfile" if flacinfo.decoder_available() else "structural-only",
+        "queue": processing.queue_overview(),
+        "costs": processing.cost_summary(),
+        "providers": provider_credentials.status(),
+        "policy": routing.describe(),
         "active_key": key,
         "store_plaintext": settings.store_plaintext,
         "password_protected": adminauth.password_required(),
@@ -624,9 +726,9 @@ def _session_detail(session_id: str) -> dict[str, Any] | None:
     except (ValueError, TypeError):
         manifest = {}
     try:
-        processing = json.loads(session["processing_json"] or "{}")
+        processing_meta = json.loads(session["processing_json"] or "{}")
     except (ValueError, TypeError):
-        processing = {}
+        processing_meta = {}
     return {
         "session": _session_row(session),
         "raw": {k: v for k, v in session.items()
@@ -647,7 +749,9 @@ def _session_detail(session_id: str) -> dict[str, Any] | None:
         "privacy_gaps": sessions.privacy_gaps(session_id),
         "missing_chunks": sessions.missing_chunks(session_id),
         "unverified_chunks": sessions.unverified_chunks(session_id),
-        "processing": processing,
+        "processing": processing_meta,
+        "results": processing.results_for(session_id),
+        "allowed_routes": sorted(routing.allowed_for(session["mode"])),
         "audit": audit.recent(limit=200, session_id=session_id),
         "purges": [dict(r) for r in db.query(
             "SELECT * FROM purges WHERE session_id = ? ORDER BY id DESC", (session_id,))],

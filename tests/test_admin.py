@@ -175,7 +175,7 @@ def test_chunk_download_encrypted_and_decrypted(server):
     assert dec.content[:4] == b"fLaC"
 
 
-def test_state_and_processing_route(server):
+def test_admin_can_set_a_session_state(server):
     rec = _ingested(server)
     server.admin_login()
     server.admin.post(f"/admin/api/sessions/{rec.session_id}/state",
@@ -183,11 +183,6 @@ def test_state_and_processing_route(server):
     assert rec.status().json()["state"] == "READY_FOR_PROCESSING"
     # the recorder still sees ingest as durably confirmed
     assert rec.status().json()["ingest_confirmed"] is True
-
-    server.admin.post(f"/admin/api/sessions/{rec.session_id}/processing",
-                      json={"route": "local"})
-    data = server.admin.get(f"/admin/api/sessions/{rec.session_id}").json()
-    assert data["processing"]["route"] == "local"
 
 
 def test_purge_removes_audio_but_keeps_the_record(server):
