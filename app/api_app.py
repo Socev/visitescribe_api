@@ -15,7 +15,7 @@ from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
 
 from . import __version__, crypto, db, flacinfo
-from .bootstrap import initialise
+from .bootstrap import STARTUP_INFO, STARTUP_PROBLEMS, initialise
 from .config import settings
 from .errors import ApiError, api_error_handler, unhandled_handler
 from .util import now_iso
@@ -77,25 +77,36 @@ def create_app() -> FastAPI:
 
     @app.get("/healthz", include_in_schema=False)
     async def healthz() -> dict:  # noqa: ANN202
+        """Liveness: true as soon as the process is serving.
+
+        Deliberately does not touch storage. A pod that never turns Ready is
+        invisible to the Olares installer, so a broken data directory has to
+        surface as a readable diagnosis rather than a crash loop.
+        """
         return {"status": "ok", "time": now_iso()}
 
     @app.get("/readyz", include_in_schema=False)
     async def readyz():  # noqa: ANN202
-        problems = []
+        problems = list(STARTUP_PROBLEMS)
         try:
             db.query_one("SELECT 1 AS x")
         except Exception as exc:  # noqa: BLE001
             problems.append(f"database: {exc}")
-        if crypto.active_key() is None:
-            problems.append("no active server key")
-        body = {
-            "status": "ok" if not problems else "degraded",
-            "version": __version__,
-            "flac_decoder": "libsndfile" if flacinfo.decoder_available() else "structural-only",
-            "problems": problems,
-            "time": now_iso(),
-        }
-        return JSONResponse(status_code=200 if not problems else 503, content=body)
+        else:
+            if crypto.active_key() is None:
+                problems.append("no active server key")
+        return JSONResponse(
+            status_code=200,
+            content={
+                "status": "ok" if not problems else "degraded",
+                "version": __version__,
+                "flac_decoder": ("libsndfile" if flacinfo.decoder_available()
+                                 else "structural-only"),
+                "problems": problems,
+                "startup": STARTUP_INFO,
+                "time": now_iso(),
+            },
+        )
 
     @app.get("/", include_in_schema=False)
     async def root() -> dict:  # noqa: ANN202

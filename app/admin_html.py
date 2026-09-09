@@ -216,6 +216,11 @@ def _sessions_table(rows: list[dict[str, Any]]) -> str:
 
 def render_dashboard(d: dict[str, Any], who: str) -> str:
     banners = []
+    for problem in d.get("startup_problems", []):
+        banners.append(
+            f'<div class="banner bad"><strong>Startup problem:</strong> '
+            f"{_e(problem)}</div>"
+        )
     if not d["password_protected"]:
         banners.append(
             '<div class="banner info">No <code>VS_ADMIN_PASSWORD</code> is set, so this '
@@ -291,6 +296,10 @@ running since {_e((d['installed_at'] or '')[:10])}</p>
 <dt>Created</dt><dd>{_e((key.get('created_at') or '')[:19].replace('T',' '))}</dd>
 <dt>Plaintext audio at rest</dt>
 <dd>{'yes (VS_STORE_PLAINTEXT is on)' if d['store_plaintext'] else 'no — ciphertext only'}</dd>
+<dt>Data directory</dt>
+<dd class="mono">{_e(d.get('startup_info', {}).get('data_dir', '—'))}</dd>
+<dt>Running as</dt>
+<dd class="mono">{_e(d.get('startup_info', {}).get('running_as', '—'))}</dd>
 </dl><p style="margin:12px 0 0"><a class="btn" href="/admin/keys">Manage keys</a></p></div>"""
     return layout("Overview", body, "dashboard", who)
 

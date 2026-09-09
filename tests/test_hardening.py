@@ -267,3 +267,37 @@ def test_copy_button_markup_is_well_formed(server):
     assert 'onclick="copy("' not in page, "attribute terminated early"
     assert "BEGIN PUBLIC KEY" in page
     assert page.count("<button") == page.count("</button>")
+
+
+def test_health_stays_up_and_readyz_reports_startup_problems(server):
+    """A broken data directory must be diagnosable, not a silent crash loop.
+
+    If the container exits, the pod never turns Ready and the Olares installer
+    sits on "Installing" with nothing to show. So /healthz answers as soon as
+    the process is serving, and /readyz carries the diagnosis at 200 so the
+    probe does not hold the install open.
+    """
+    import app.bootstrap as bootstrap
+
+    assert server.client.get("/healthz").json()["status"] == "ok"
+    ready = server.client.get("/readyz")
+    assert ready.status_code == 200
+    assert ready.json()["status"] == "ok"
+    assert ready.json()["startup"]["data_dir"]
+    assert "uid" in ready.json()["startup"]["running_as"]
+
+    bootstrap.STARTUP_PROBLEMS.append("/data is not writable by uid 1000:gid 1000")
+    try:
+        assert server.client.get("/healthz").status_code == 200
+        ready = server.client.get("/readyz")
+        assert ready.status_code == 200, "a probe failure would hide the diagnosis"
+        assert ready.json()["status"] == "degraded"
+        assert any("not writable" in p for p in ready.json()["problems"])
+
+        server.admin_login()
+        page = server.admin.get("/admin/")
+        assert page.status_code == 200
+        assert "Startup problem" in page.text
+        assert "not writable" in page.text
+    finally:
+        bootstrap.STARTUP_PROBLEMS.clear()

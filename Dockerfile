@@ -34,13 +34,12 @@ COPY app/ /app/app/
 COPY tools/ /app/tools/
 COPY README.md /app/
 
-# Olares mounts appData as the host user; 1000 matches `spec.runAsUser`.
-RUN groupadd -g 1000 visitescribe \
- && useradd -u 1000 -g 1000 -m -s /usr/sbin/nologin visitescribe \
- && mkdir -p /data \
- && chown -R 1000:1000 /data /app
+# Runs as root, matching every shipping Olares application. The data volume is
+# a hostPath created by the kubelet and owned by root; fsGroup does not apply
+# to hostPath volumes, so a non-root container would be locked out of its own
+# storage and crash-loop invisibly behind the installer.
+RUN mkdir -p /data
 
-USER 1000:1000
 VOLUME ["/data"]
 EXPOSE 8080 8081
 

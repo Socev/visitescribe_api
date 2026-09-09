@@ -28,7 +28,7 @@ from .admin_html import (
     render_sessions,
 )
 from .auth import create_device
-from .bootstrap import initialise
+from .bootstrap import STARTUP_INFO, STARTUP_PROBLEMS, initialise
 from .config import ALL_STATES, settings
 from .errors import ApiError, api_error_handler, unhandled_handler
 from .util import b64decode_strict, is_device_id, new_token, now, now_iso, token_hash
@@ -543,6 +543,8 @@ def _dashboard_data() -> dict[str, Any]:
         "active_key": key,
         "store_plaintext": settings.store_plaintext,
         "password_protected": adminauth.password_required(),
+        "startup_problems": list(STARTUP_PROBLEMS),
+        "startup_info": dict(STARTUP_INFO),
         "installed_at": db.get_meta("installed_at"),
         "server_time": now_iso(),
     }
