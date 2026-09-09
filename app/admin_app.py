@@ -40,6 +40,10 @@ async def _lifespan(app: FastAPI):  # noqa: ANN201, ARG001
     yield
 
 
+# Ceiling on an in-memory WAV export.
+MAX_WAV_EXPORT_BYTES = 512 * 1024 * 1024
+
+
 def create_admin_app() -> FastAPI:
     app = FastAPI(
         lifespan=_lifespan,
@@ -719,6 +723,24 @@ def _session_wav(session_id: str) -> bytes:
         "SELECT * FROM chunks WHERE session_id = ? ORDER BY sequence", (session_id,))]
     if not rows:
         raise ApiError("UNKNOWN_SESSION", "Session has no chunks")
+    # A whole session is decoded and concatenated in memory here, so a long
+    # recording is refused rather than allowed to exhaust the pod. The .zip
+    # export streams and has no such limit.
+    estimated = 0
+    for row in rows:
+        try:
+            info = json.loads(row.get("flac_json") or "{}")
+        except (ValueError, TypeError):
+            info = {}
+        rate = info.get("sample_rate") or 48000
+        estimated += int((info.get("duration_ms") or 0) / 1000 * rate) *             max(int(info.get("channels") or 1), 1) * 2
+    if estimated > MAX_WAV_EXPORT_BYTES:
+        raise ApiError(
+            "PAYLOAD_TOO_LARGE",
+            f"This session would export to about {estimated // (1024 * 1024)} MB of "
+            f"WAV, above the {MAX_WAV_EXPORT_BYTES // (1024 * 1024)} MB limit. "
+            "Download the .zip and decode it locally instead.",
+        )
     blocks = []
     rate = None
     channels = None
@@ -790,6 +812,15 @@ def _purge(session_id: str, scope: str, who: str) -> dict[str, Any]:
                 "wrap_ciphertext_b64 = NULL, purged_at = ?, updated_at = ? "
                 "WHERE session_id = ?",
                 (now_iso(), now_iso(), session_id),
+            )
+        elif scope == "source_audio":
+            # ingest_confirmed means "every manifested chunk is on durable
+            # storage". Once the source audio is gone that is no longer true,
+            # so the flag must drop with it rather than wait for the next
+            # evaluate() to notice.
+            conn.execute(
+                "UPDATE sessions SET ingest_confirmed = 0, updated_at = ? "
+                "WHERE session_id = ?", (now_iso(), session_id),
             )
         # The audit trail of the purge itself is deliberately retained.
         audit.log("purge", f"purged_{scope}", "success", session_id=session_id,

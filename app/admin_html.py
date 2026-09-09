@@ -703,7 +703,7 @@ def render_keys(keys: list[dict[str, Any]], who: str) -> str:
 {_e((k['created_at'] or '')[:19].replace('T',' '))}
 {('· retired ' + _e((k['retired_at'] or '')[:19].replace('T',' '))) if k['retired_at'] else ''}
 </div></div>
-<div class="narrow"><button onclick="copy({json.dumps(k['public_pem'])})">Copy public key</button>
+<div class="narrow"><button onclick='copy({_e(json.dumps(k["public_pem"]))})'>Copy public key</button>
 </div></div>
 <pre style="margin-top:10px">{_e(k['public_pem'])}</pre></div>"""
         for k in keys

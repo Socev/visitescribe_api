@@ -8,6 +8,7 @@ points at data which is not on disk.
 from __future__ import annotations
 
 import os
+import secrets
 import shutil
 from pathlib import Path
 
@@ -37,18 +38,33 @@ def _fsync_dir(path: Path) -> None:
 
 
 def write_durable(path: Path, data: bytes) -> None:
+    """Write `data` to `path` so that it survives a power cut.
+
+    The temporary name carries a random suffix: two concurrent retries of the
+    same chunk would otherwise share one temp file, and the first rename would
+    pull the file out from under the second. Both writers now stage their own
+    copy and the rename is a plain atomic replace of identical content.
+    """
     path.parent.mkdir(parents=True, exist_ok=True)
-    tmp = path.with_name(path.name + ".tmp")
-    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    tmp = path.with_name(f"{path.name}.{secrets.token_hex(8)}.tmp")
     try:
-        written = 0
-        view = memoryview(data)
-        while written < len(view):
-            written += os.write(fd, view[written:])
-        os.fsync(fd)
-    finally:
-        os.close(fd)
-    os.replace(tmp, path)
+        fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+        try:
+            written = 0
+            view = memoryview(data)
+            while written < len(view):
+                written += os.write(fd, view[written:])
+            os.fsync(fd)
+        finally:
+            os.close(fd)
+        os.replace(tmp, path)
+    except BaseException:
+        # Never leave a half-written staging file behind.
+        try:
+            tmp.unlink()
+        except OSError:
+            pass
+        raise
     _fsync_dir(path.parent)
 
 

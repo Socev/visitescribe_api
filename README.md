@@ -87,19 +87,30 @@ The wire contract matches the v0.2 client exactly: the same headers, the same
 Each `PUT` is refused unless **all** of this holds, in this order:
 
 1. `SHA-256(body)` equals `X-Chunk-SHA256`.
-2. If this sequence already exists, the new content is byte-identical
+2. The nonce has not already been used by another chunk in this session.
+   Repeating a nonce under one AES-GCM key is a total break of the cipher — the
+   plaintexts XOR out and the authentication subkey falls — and the server is
+   the only party positioned to notice a recorder with a broken RNG or a
+   restarted counter. It is refused loudly, and the database carries a unique
+   index so one cannot be stored even if this check were bypassed.
+3. If this sequence already exists, the new content is byte-identical
    (`200`, marked `duplicate`) — otherwise `409 CHUNK_CONFLICT`.
-3. The ciphertext and plaintext hashes match what the manifest declared.
-4. AES-256-GCM opens with the session key, the supplied nonce, and the AAD used
-   **byte for byte** — `X-Chunk-AAD.encode("utf-8")`, never trimmed,
-   normalised, lowercased or re-serialised.
-5. `SHA-256(plaintext)` equals `X-Plaintext-SHA256`.
-6. The plaintext is genuinely FLAC: `fLaC` magic, a well-formed STREAMINFO, a
+4. The ciphertext and plaintext hashes match what the manifest declared.
+5. AES-256-GCM opens with the session key, the supplied nonce, and the AAD used
+   **byte for byte** — taken from the raw request headers, never trimmed,
+   normalised, lowercased, re-serialised or re-encoded.
+6. `SHA-256(plaintext)` equals `X-Plaintext-SHA256`.
+7. The plaintext is genuinely FLAC: `fLaC` magic, a well-formed STREAMINFO, a
    valid metadata chain and a real frame sync code — then a full libsndfile
-   decode, and when STREAMINFO carries an MD5 of the unencoded audio, the
-   decoded PCM is hashed and compared. That last check catches corruption an
-   authentic GCM tag cannot: audio damaged *before* it was encrypted.
-7. Sample rate, channel count and bit depth agree with the manifest.
+   decode in bounded blocks, and when STREAMINFO carries an MD5 of the
+   unencoded audio, the decoded PCM is hashed and compared. That last check
+   catches corruption an authentic GCM tag cannot: audio damaged *before* it
+   was encrypted.
+8. The stream does not decode to more than `VS_MAX_DECODED_BYTES`. FLAC of
+   digital silence compresses several thousand to one, so a few hundred
+   kilobytes on the wire could otherwise allocate gigabytes; the limit is
+   checked from the header before any decoding starts.
+9. Sample rate, channel count and bit depth agree with the manifest.
 
 Only then is the ciphertext written (temp file → `fsync` → rename →
 `fsync` of the directory) and the row committed.
@@ -117,7 +128,8 @@ no blob, so the recorder simply retries it.
 `INVALID_DEVICE`, `DEVICE_DISABLED`, `DEVICE_CERT_MISMATCH`, `DEVICE_NOT_OWNER`,
 `UNKNOWN_SESSION`, `INVALID_SCHEMA_VERSION`, `INVALID_MANIFEST`,
 `INVALID_KEY_WRAP`, `CHUNK_NOT_IN_MANIFEST`, `CHUNK_HASH_MISMATCH`,
-`CHUNK_DECRYPT_FAILED`, `PLAINTEXT_HASH_MISMATCH`, `INVALID_FLAC`,
+`CHUNK_DECRYPT_FAILED`, `PLAINTEXT_HASH_MISMATCH`, `INVALID_FLAC`, `NONCE_REUSE`,
+`DEVICE_UPLOADS_PAUSED`,
 `CHUNK_CONFLICT`, `IDEMPOTENCY_CONFLICT`, `SESSION_DEVICE_CONFLICT`,
 `MISSING_CHUNKS`, `SESSION_ALREADY_FINALIZED`, `SESSION_PURGED`,
 `PAYLOAD_TOO_LARGE`, `RATE_LIMITED`, `NO_SERVER_KEY`.
@@ -258,7 +270,8 @@ purge happened is always retained.**
 | `VS_SESSION_KEY_CACHE_SECONDS` | `900` | how long an unwrapped session key stays in memory |
 | `VS_STORE_PLAINTEXT` | `false` | also persist decrypted FLAC |
 | `VS_FLAC_DEEP_VERIFY` | `true` | fully decode every chunk |
-| `VS_MAX_CHUNK_BYTES` | `67108864` | per-chunk size limit |
+| `VS_MAX_CHUNK_BYTES` | `67108864` | per-chunk size limit, enforced while streaming |
+| `VS_MAX_DECODED_BYTES` | `67108864` | ceiling on what one chunk may decode to |
 | `VS_MAX_JSON_BYTES` | `8388608` | JSON body limit |
 | `VS_RATE_LIMIT_PER_MINUTE` | `600` | per-device rate limit |
 | `VS_RATE_LIMIT_BURST` | `240` | its burst allowance |
@@ -306,13 +319,17 @@ pip install -r requirements-dev.txt
 pytest tests/ -q
 ```
 
-76 tests covering the complete 20-step acceptance flow from the specification,
+89 tests covering the complete 20-step acceptance flow from the specification,
 every listed negative case (wrong device, wrong certificate identity, bad key
 wrap, wrong nonce, wrong AAD, wrong ciphertext hash, wrong plaintext hash, GCM
 authentication failure, invalid FLAC, chunk not in manifest, duplicate chunk with
 different content, complete with missing chunks, the same session ID from another
 device), plus restart durability, concurrent uploads, out-of-order delivery, key
-rotation across a live session, and the admin interface.
+rotation across a live session, and the admin interface — plus regression tests
+for every issue found in review: FLAC decompression bombs, unbounded chunked
+request bodies, GCM nonce reuse, non-ASCII AAD handling, paused uploads,
+`ingest_confirmed` surviving a purge, and out-of-range patient boundaries
+producing inverted segments.
 
 ## Licence
 

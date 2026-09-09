@@ -30,6 +30,15 @@ except Exception:  # noqa: BLE001
 
 FLAC_MAGIC = b"fLaC"
 
+# A FLAC stream of digital silence compresses enormously: a few hundred KiB of
+# ciphertext can declare hours of audio, and decoding it would allocate
+# gigabytes. Both limits are checked from the header *before* any decode, and
+# again while streaming, so a malicious or malfunctioning recorder cannot
+# exhaust the pod's memory with one upload.
+MAX_DECODED_BYTES = 64 * 1024 * 1024      # ~5.5 minutes of 48 kHz mono, int32
+MAX_TOTAL_SAMPLES = 1 << 32
+DECODE_BLOCK_FRAMES = 65536
+
 BLOCK_STREAMINFO = 0
 BLOCK_PADDING = 1
 BLOCK_APPLICATION = 2
@@ -158,6 +167,10 @@ def parse_structure(data: bytes) -> FlacInfo:
 
     sample_rate = int(info["sample_rate"])
     total = int(info["total_samples"])
+    if total > MAX_TOTAL_SAMPLES:
+        raise FlacError(
+            f"STREAMINFO declares {total} samples, above the {MAX_TOTAL_SAMPLES} limit"
+        )
     result = FlacInfo(
         valid=True,
         sample_rate=sample_rate,
@@ -175,30 +188,43 @@ def parse_structure(data: bytes) -> FlacInfo:
     return result
 
 
-def _pcm_md5(samples, bits_per_sample: int) -> str | None:
-    """MD5 over the unencoded audio, as FLAC defines it, for 8/16/24-bit."""
+def _pcm_bytes(samples, bits_per_sample: int) -> bytes | None:
+    """The unencoded audio bytes as FLAC defines them, for 8/16/24-bit."""
     np = _numpy
     if np is None:
         return None
     if bits_per_sample == 16:
-        raw = samples.astype("<i2").tobytes()
-    elif bits_per_sample == 8:
-        raw = (samples.astype("<i2") + 128).astype("u1").tobytes()
-    elif bits_per_sample == 24:
+        return samples.astype("<i2").tobytes()
+    if bits_per_sample == 8:
+        return (samples.astype("<i2") + 128).astype("u1").tobytes()
+    if bits_per_sample == 24:
         as32 = samples.astype("<i4").reshape(-1)
-        raw = np.frombuffer(as32.tobytes(), dtype="u1").reshape(-1, 4)[:, :3].tobytes()
-    else:
-        return None
-    return hashlib.md5(raw).hexdigest()  # noqa: S324 - format-mandated, not security
+        return np.frombuffer(as32.tobytes(), dtype="u1").reshape(-1, 4)[:, :3].tobytes()
+    return None
 
 
-def deep_verify(data: bytes, info: FlacInfo) -> FlacInfo:
-    """Fully decode the stream. Never raises for a missing decoder."""
+def deep_verify(data: bytes, info: FlacInfo,
+                max_decoded_bytes: int = MAX_DECODED_BYTES) -> FlacInfo:
+    """Fully decode the stream in bounded blocks. Never raises for a missing
+    decoder, always raises for a stream that would decode too large."""
     if _soundfile is None or _numpy is None:
         info.warnings.append(
             "libsndfile or numpy unavailable; structural validation only"
         )
         return info
+
+    bytes_per_frame = max(info.channels, 1) * 4  # soundfile hands back int32
+    if info.total_samples:
+        declared = info.total_samples * bytes_per_frame
+        if declared > max_decoded_bytes:
+            raise FlacError(
+                f"stream declares {declared} decoded bytes, above the "
+                f"{max_decoded_bytes} limit"
+            )
+
+    digest = hashlib.md5()  # noqa: S324 - format-mandated, not security
+    md5_usable = bool(info.md5) and info.md5 != "0" * 32
+    frames = 0
     try:
         with _soundfile.SoundFile(io.BytesIO(data)) as handle:
             if handle.format != "FLAC":
@@ -207,13 +233,30 @@ def deep_verify(data: bytes, info: FlacInfo) -> FlacInfo:
                 raise FlacError("decoded sample rate disagrees with STREAMINFO")
             if handle.channels != info.channels:
                 raise FlacError("decoded channel count disagrees with STREAMINFO")
-            samples = handle.read(dtype="int32", always_2d=True)
+            if handle.frames and handle.frames * bytes_per_frame > max_decoded_bytes:
+                raise FlacError(
+                    f"stream would decode to {handle.frames * bytes_per_frame} "
+                    f"bytes, above the {max_decoded_bytes} limit"
+                )
+            shift = 32 - info.bits_per_sample
+            for block in handle.blocks(blocksize=DECODE_BLOCK_FRAMES, dtype="int32",
+                                       always_2d=True):
+                frames += int(block.shape[0])
+                if frames * bytes_per_frame > max_decoded_bytes:
+                    raise FlacError(
+                        f"stream decoded past the {max_decoded_bytes} byte limit"
+                    )
+                if md5_usable:
+                    raw = _pcm_bytes(block >> shift, info.bits_per_sample)
+                    if raw is None:
+                        md5_usable = False
+                    else:
+                        digest.update(raw)
     except FlacError:
         raise
     except Exception as exc:  # noqa: BLE001
         raise FlacError(f"stream is not decodable: {exc}") from exc
 
-    frames = int(samples.shape[0])
     if info.total_samples and frames != info.total_samples:
         raise FlacError(
             f"decoded {frames} frames but STREAMINFO declares {info.total_samples}"
@@ -224,21 +267,18 @@ def deep_verify(data: bytes, info: FlacInfo) -> FlacInfo:
         info.total_samples = frames
         info.duration_ms = int(round(frames * 1000 / info.sample_rate))
 
-    if info.md5 and info.md5 != "0" * 32:
-        # soundfile hands back left-aligned int32; shift down to the real depth.
-        shifted = samples >> (32 - info.bits_per_sample)
-        digest = _pcm_md5(shifted, info.bits_per_sample)
-        if digest is not None:
-            info.md5_verified = digest == info.md5
-            if not info.md5_verified:
-                raise FlacError("decoded audio does not match the STREAMINFO MD5")
+    if md5_usable:
+        info.md5_verified = digest.hexdigest() == info.md5
+        if not info.md5_verified:
+            raise FlacError("decoded audio does not match the STREAMINFO MD5")
     return info
 
 
-def validate(data: bytes, deep: bool = True) -> FlacInfo:
+def validate(data: bytes, deep: bool = True,
+             max_decoded_bytes: int = MAX_DECODED_BYTES) -> FlacInfo:
     info = parse_structure(data)
     if deep:
-        info = deep_verify(data, info)
+        info = deep_verify(data, info, max_decoded_bytes=max_decoded_bytes)
     return info
 
 

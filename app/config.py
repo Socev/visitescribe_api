@@ -54,6 +54,10 @@ class Settings:
     schema_version: int = field(default_factory=lambda: _i("VS_SCHEMA_VERSION", 2))
     max_chunk_bytes: int = field(default_factory=lambda: _i("VS_MAX_CHUNK_BYTES", 64 * 1024 * 1024))
     max_json_bytes: int = field(default_factory=lambda: _i("VS_MAX_JSON_BYTES", 8 * 1024 * 1024))
+    # Upper bound on how large one chunk may decode to. A FLAC stream of
+    # silence compresses ~4000x, so without this a few hundred KiB of
+    # ciphertext could allocate gigabytes.
+    max_decoded_bytes: int = field(default_factory=lambda: _i("VS_MAX_DECODED_BYTES", 64 * 1024 * 1024))
     max_chunks_per_session: int = field(default_factory=lambda: _i("VS_MAX_CHUNKS_PER_SESSION", 20000))
     max_events_per_request: int = field(default_factory=lambda: _i("VS_MAX_EVENTS_PER_REQUEST", 2000))
 

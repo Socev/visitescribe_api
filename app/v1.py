@@ -1,6 +1,7 @@
 """The /v1 ingest API — the contract the recorder depends on."""
 from __future__ import annotations
 
+import asyncio
 import json
 from typing import Any
 
@@ -25,10 +26,25 @@ from .util import (
 
 router = APIRouter(prefix="/v1")
 
+# SQLite stores signed 64-bit integers; anything beyond this is a payload
+# problem, not a server fault.
+MAX_SEQUENCE = 2**31 - 1
+
 
 # ---------------------------------------------------------------------------
 # helpers
 # ---------------------------------------------------------------------------
+
+def _require_uploads_enabled(ident: DeviceIdentity) -> None:
+    """An administrator can pause a device without disabling it entirely."""
+    if not ident.row.get("upload_enabled", 1):
+        audit.log("auth", "uploads_paused", "failure", device_id=ident.device_id,
+                  source_ip=ident.source_ip)
+        raise ApiError(
+            "DEVICE_UPLOADS_PAUSED",
+            "Uploads are paused for this device by an administrator",
+        )
+
 
 def _identity(request: Request) -> DeviceIdentity:
     ident = authenticate(request)
@@ -41,20 +57,48 @@ def _identity(request: Request) -> DeviceIdentity:
     return ident
 
 
-async def _json_body(request: Request, limit: int | None = None) -> Any:
-    cap = limit or settings.max_json_bytes
+async def _read_capped(request: Request, cap: int, what: str) -> bytes:
+    """Read a body, aborting as soon as it exceeds `cap`.
+
+    Content-Length is only a hint — a chunked request has none — so the limit
+    is enforced while streaming rather than after buffering the whole thing.
+    """
     declared = request.headers.get("content-length")
     if declared and declared.isdigit() and int(declared) > cap:
-        raise ApiError("PAYLOAD_TOO_LARGE", f"JSON body exceeds {cap} bytes")
-    raw = await request.body()
-    if len(raw) > cap:
-        raise ApiError("PAYLOAD_TOO_LARGE", f"JSON body exceeds {cap} bytes")
+        raise ApiError("PAYLOAD_TOO_LARGE", f"{what} exceeds {cap} bytes")
+    parts: list[bytes] = []
+    total = 0
+    async for piece in request.stream():
+        total += len(piece)
+        if total > cap:
+            raise ApiError("PAYLOAD_TOO_LARGE", f"{what} exceeds {cap} bytes")
+        parts.append(piece)
+    return b"".join(parts)
+
+
+async def _json_body(request: Request, limit: int | None = None) -> Any:
+    cap = limit or settings.max_json_bytes
+    raw = await _read_capped(request, cap, "JSON body")
     if not raw:
         raise ApiError("INVALID_REQUEST", "Request body is empty")
     try:
         return json.loads(raw)
     except ValueError as exc:
         raise ApiError("INVALID_REQUEST", f"Body is not valid JSON: {exc}") from exc
+
+
+def _raw_header(request: Request, name: str) -> bytes | None:
+    """The header's bytes exactly as they arrived.
+
+    Starlette decodes header values as latin-1, so re-encoding them as UTF-8
+    silently corrupts any non-ASCII AAD. The GCM AAD has to be the bytes on the
+    wire, so it is taken from the raw scope.
+    """
+    wanted = name.lower().encode("latin-1")
+    for key, value in request.scope.get("headers", ()):
+        if key.lower() == wanted:
+            return value
+    return None
 
 
 def _owned_session(session_id: str, ident: DeviceIdentity) -> dict[str, Any]:
@@ -100,6 +144,7 @@ def _session_key(session: dict[str, Any]) -> bytes:
 @router.post("/sessions")
 async def create_session(request: Request) -> Response:
     ident = _identity(request)
+    _require_uploads_enabled(ident)
     payload = await _json_body(request)
     idem_key = idempotency.key_of(request.headers)
 
@@ -278,14 +323,24 @@ def _validate_manifest_chunks(manifest: SessionManifest) -> list[dict[str, Any]]
     if len(manifest.chunks) > settings.max_chunks_per_session:
         raise ApiError("INVALID_MANIFEST", "manifest lists too many chunks")
     seen: set[int] = set()
+    nonces: dict[str, int] = {}
     specs: list[dict[str, Any]] = []
     for chunk in manifest.chunks:
         seq = chunk.sequence
-        if not isinstance(seq, int) or seq < 0:
+        if not isinstance(seq, int) or not 0 <= seq <= MAX_SEQUENCE:
             raise ApiError("INVALID_MANIFEST", f"invalid chunk sequence {seq!r}")
         if seq in seen:
             raise ApiError("INVALID_MANIFEST", f"duplicate chunk sequence {seq}")
         seen.add(seq)
+        if chunk.nonce_b64:
+            previous = nonces.get(chunk.nonce_b64)
+            if previous is not None:
+                raise ApiError(
+                    "NONCE_REUSE",
+                    f"chunks {previous} and {seq} declare the same AES-GCM nonce; "
+                    "reusing a nonce under one session key destroys its security",
+                )
+            nonces[chunk.nonce_b64] = seq
         for field in ("plaintext_sha256", "ciphertext_sha256"):
             value = getattr(chunk, field)
             if value is not None and not is_sha256_hex(value):
@@ -360,6 +415,7 @@ def _short_errors(exc: ValidationError) -> list[str]:
 @router.put("/sessions/{session_id}/chunks/{sequence}")
 async def put_chunk(session_id: str, sequence: int, request: Request) -> Response:
     ident = _identity(request)
+    _require_uploads_enabled(ident)
     session = _owned_session(session_id, ident)
     idem_key = idempotency.key_of(request.headers)
 
@@ -381,7 +437,12 @@ async def put_chunk(session_id: str, sequence: int, request: Request) -> Respons
     except ValueError as exc:
         raise ApiError("INVALID_REQUEST", f"X-Chunk-Nonce is not valid base64: {exc}") from exc
     # AAD is used byte-for-byte: no trimming, no normalisation, no re-serialising.
-    aad = aad_text.encode("utf-8")
+    aad = _raw_header(request, "x-chunk-aad")
+    if aad is None:
+        raise ApiError("INVALID_REQUEST", "X-Chunk-AAD is required")
+    aad_sha = sha256_hex(aad)
+    # Stored for display; the hash above is what identity comparisons use.
+    aad_text = aad.decode("utf-8", errors="replace")
 
     spec = db.row_to_dict(
         db.query_one(
@@ -398,18 +459,7 @@ async def put_chunk(session_id: str, sequence: int, request: Request) -> Respons
             f"Sequence {sequence} is not listed in the session manifest",
         )
 
-    declared_len = request.headers.get("content-length")
-    if declared_len and declared_len.isdigit() and int(declared_len) > settings.max_chunk_bytes:
-        raise ApiError(
-            "PAYLOAD_TOO_LARGE",
-            f"Chunk exceeds the {settings.max_chunk_bytes} byte limit",
-        )
-    body = await request.body()
-    if len(body) > settings.max_chunk_bytes:
-        raise ApiError(
-            "PAYLOAD_TOO_LARGE",
-            f"Chunk exceeds the {settings.max_chunk_bytes} byte limit",
-        )
+    body = await _read_capped(request, settings.max_chunk_bytes, "Chunk")
     if not body:
         raise ApiError("INVALID_REQUEST", "Chunk body is empty")
 
@@ -426,7 +476,26 @@ async def put_chunk(session_id: str, sequence: int, request: Request) -> Respons
             "Ciphertext SHA-256 does not match X-Chunk-SHA256",
         )
 
-    # --- 2. idempotent retry ---------------------------------------------
+    # --- 2. nonce reuse ---------------------------------------------------
+    # Two chunks encrypted with the same nonce under one session key is a total
+    # break of AES-GCM: the plaintexts XOR out and the authentication subkey
+    # falls. The server is the only party able to notice a recorder with a
+    # broken RNG or a restarted counter, so it refuses the upload loudly.
+    reused = db.query_one(
+        "SELECT sequence FROM chunks WHERE session_id = ? AND nonce_b64 = ? "
+        "AND sequence != ?", (session_id, nonce_b64, sequence))
+    if reused is not None:
+        audit.log("security", "nonce_reuse", "failure", device_id=ident.device_id,
+                  session_id=session_id, sequence=sequence, source_ip=ident.source_ip,
+                  idempotency_key=idem_key,
+                  detail={"nonce_already_used_by_sequence": int(reused["sequence"])})
+        raise ApiError(
+            "NONCE_REUSE",
+            f"This nonce was already used by chunk {int(reused['sequence'])} in this "
+            "session; reusing an AES-GCM nonce under one key destroys its security",
+        )
+
+    # --- 3. idempotent retry ---------------------------------------------
     # Checked before the manifest cross-check so that re-sending altered bytes
     # under an existing sequence is reported as the conflict it is, rather than
     # as a generic hash mismatch.
@@ -441,7 +510,8 @@ async def put_chunk(session_id: str, sequence: int, request: Request) -> Respons
             existing["ciphertext_sha256"] == actual_ct_sha
             and existing["plaintext_sha256"] == declared_pt_sha
             and existing["nonce_b64"] == nonce_b64
-            and existing["aad"] == aad_text
+            and (existing["aad_sha256"] or sha256_hex(
+                (existing["aad"] or "").encode("utf-8"))) == aad_sha
         )
         if identical:
             audit.log("chunk", "duplicate_accepted", "success", device_id=ident.device_id,
@@ -455,7 +525,7 @@ async def put_chunk(session_id: str, sequence: int, request: Request) -> Respons
                       "stored_ciphertext_sha256": existing["ciphertext_sha256"],
                       "uploaded_ciphertext_sha256": actual_ct_sha,
                       "nonce_changed": existing["nonce_b64"] != nonce_b64,
-                      "aad_changed": existing["aad"] != aad_text,
+                      "aad_changed": existing["aad_sha256"] != aad_sha,
                   })
         raise ApiError(
             "CHUNK_CONFLICT",
@@ -468,7 +538,7 @@ async def put_chunk(session_id: str, sequence: int, request: Request) -> Respons
             "Ingest for this session is already confirmed",
         )
 
-    # --- 3. agreement with the manifest -----------------------------------
+    # --- 4. agreement with the manifest -----------------------------------
     if spec["ciphertext_sha256"] and spec["ciphertext_sha256"] != actual_ct_sha:
         audit.log("integrity", "manifest_ciphertext_mismatch", "failure",
                   device_id=ident.device_id, session_id=session_id, sequence=sequence,
@@ -487,10 +557,10 @@ async def put_chunk(session_id: str, sequence: int, request: Request) -> Respons
             "X-Plaintext-SHA256 does not match the hash declared in the manifest",
         )
 
-    # --- 4. decrypt and authenticate --------------------------------------
+    # --- 5. decrypt and authenticate --------------------------------------
     key = _session_key(session)
     try:
-        plaintext = crypto.decrypt_chunk(key, nonce, aad, body)
+        plaintext = await asyncio.to_thread(crypto.decrypt_chunk, key, nonce, aad, body)
     except crypto.DecryptError as exc:
         audit.log("security", "chunk_decrypt_failed", "failure", device_id=ident.device_id,
                   session_id=session_id, sequence=sequence, source_ip=ident.source_ip,
@@ -499,7 +569,7 @@ async def put_chunk(session_id: str, sequence: int, request: Request) -> Respons
                           "aad_bytes": len(aad), "ciphertext_bytes": len(body)})
         raise ApiError("CHUNK_DECRYPT_FAILED", str(exc)) from exc
 
-    # --- 5. plaintext integrity -------------------------------------------
+    # --- 6. plaintext integrity -------------------------------------------
     actual_pt_sha = sha256_hex(plaintext)
     if actual_pt_sha != declared_pt_sha:
         audit.log("integrity", "plaintext_hash_mismatch", "failure",
@@ -511,9 +581,12 @@ async def put_chunk(session_id: str, sequence: int, request: Request) -> Respons
             "Decrypted SHA-256 does not match X-Plaintext-SHA256",
         )
 
-    # --- 6. the plaintext must really be FLAC ------------------------------
+    # --- 7. the plaintext must really be FLAC ------------------------------
     try:
-        info = flacinfo.validate(plaintext, deep=settings.flac_deep_verify)
+        info = await asyncio.to_thread(
+            flacinfo.validate, plaintext, settings.flac_deep_verify,
+            settings.max_decoded_bytes,
+        )
     except flacinfo.FlacError as exc:
         audit.log("integrity", "invalid_flac", "failure", device_id=ident.device_id,
                   session_id=session_id, sequence=sequence, source_ip=ident.source_ip,
@@ -537,27 +610,27 @@ async def put_chunk(session_id: str, sequence: int, request: Request) -> Respons
             f"but the decrypted chunk is {len(plaintext)} bytes"
         )
 
-    # --- 7. durable storage, then the database row -------------------------
+    # --- 8. durable storage, then the database row -------------------------
     blob = storage.chunk_path(session_id, sequence)
-    storage.write_durable(blob, body)
+    await asyncio.to_thread(storage.write_durable, blob, body)
     plaintext_blob: str | None = None
     if settings.store_plaintext:
         pt_path = storage.plaintext_path(session_id, sequence)
-        storage.write_durable(pt_path, plaintext)
+        await asyncio.to_thread(storage.write_durable, pt_path, plaintext)
         plaintext_blob = str(pt_path)
 
     received_at = now_iso()
     with db.tx() as conn:
         conn.execute(
             "INSERT INTO chunks(session_id, sequence, ciphertext_sha256, plaintext_sha256, "
-            "nonce_b64, aad, ciphertext_size, plaintext_size, blob_path, plaintext_blob_path, "
-            "ciphertext_verified, decrypt_verified, plaintext_verified, flac_valid, "
-            "flac_deep_verified, flac_json, received_at) "
-            "VALUES(?,?,?,?,?,?,?,?,?,?,1,1,1,1,?,?,?) "
+            "nonce_b64, aad, aad_sha256, ciphertext_size, plaintext_size, blob_path, "
+            "plaintext_blob_path, ciphertext_verified, decrypt_verified, "
+            "plaintext_verified, flac_valid, flac_deep_verified, flac_json, received_at) "
+            "VALUES(?,?,?,?,?,?,?,?,?,?,?,1,1,1,1,?,?,?) "
             "ON CONFLICT(session_id, sequence) DO NOTHING",
             (
                 session_id, sequence, actual_ct_sha, actual_pt_sha, nonce_b64, aad_text,
-                len(body), len(plaintext), str(blob), plaintext_blob,
+                aad_sha, len(body), len(plaintext), str(blob), plaintext_blob,
                 1 if info.deep_verified else 0,
                 json.dumps(info.to_dict(), default=str), received_at,
             ),

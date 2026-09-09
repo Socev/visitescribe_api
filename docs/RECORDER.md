@@ -53,10 +53,18 @@ Nothing else changes.
 
 ## Details that matter
 
-**The AAD is used byte for byte.** The server does
-`X-Chunk-AAD.encode("utf-8")` and nothing else — no trimming, no normalising, no
-JSON round-trip. Send the exact string that was authenticated at encryption time
-or the GCM tag will not verify.
+**The AAD is used byte for byte.** The server takes it from the raw request
+headers and passes it to AES-GCM unchanged — no trimming, no normalising, no
+JSON round-trip, no re-encoding. Send the exact bytes that were authenticated at
+encryption time or the GCM tag will not verify. Non-ASCII AADs are fine; send
+them UTF-8 encoded.
+
+**Every chunk in a session needs its own nonce.** A repeated nonce under one
+session key is a total break of AES-GCM, so the server refuses the upload with
+`NONCE_REUSE` — both when the manifest declares a duplicate and when the second
+chunk arrives. Generate 12 random bytes per chunk, or use a counter that cannot
+restart. If you ever see this error, the recorder's RNG or counter is broken and
+the audio already uploaded for that session should be treated as compromised.
 
 **The manifest is the source of truth.** `ciphertext_sha256` and
 `plaintext_sha256` in the manifest are checked against every upload. Write the
@@ -67,6 +75,12 @@ re-sent `POST /v1/sessions` legitimately carries different bytes. Session
 identity is judged on meaning — including the unwrapped session key — not on the
 exact bytes, so a re-wrap is not a conflict. Wrapping a *different* key for the
 same session still is.
+
+**Uploads can be paused.** An administrator can pause a device without
+disabling it. `POST /v1/sessions` and chunk uploads then return `403
+DEVICE_UPLOADS_PAUSED`, while `GET /v1/device/config` keeps working and reports
+`"upload_enabled": false` — so the recorder can learn why and back off instead
+of hammering.
 
 **Retry anything.** Every write is idempotent. A request the server processed but
 whose response was lost can be re-sent safely; a chunk already stored returns

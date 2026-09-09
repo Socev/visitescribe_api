@@ -115,6 +115,7 @@ CREATE TABLE IF NOT EXISTS chunks (
     plaintext_sha256    TEXT NOT NULL,
     nonce_b64           TEXT NOT NULL,
     aad                 TEXT NOT NULL,
+    aad_sha256          TEXT NOT NULL DEFAULT '',
     ciphertext_size     INTEGER NOT NULL,
     plaintext_size      INTEGER NOT NULL,
     blob_path           TEXT NOT NULL,
@@ -128,6 +129,9 @@ CREATE TABLE IF NOT EXISTS chunks (
     received_at         TEXT NOT NULL,
     PRIMARY KEY (session_id, sequence)
 );
+-- A repeated GCM nonce under one session key is a total break of AES-GCM.
+-- The database refuses to store one even if a check above is ever bypassed.
+CREATE UNIQUE INDEX IF NOT EXISTS idx_chunks_nonce ON chunks(session_id, nonce_b64);
 
 CREATE TABLE IF NOT EXISTS events (
     id           INTEGER PRIMARY KEY AUTOINCREMENT,

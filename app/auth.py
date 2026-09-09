@@ -46,14 +46,37 @@ class DeviceIdentity:
             return {}
 
 
+def _is_trusted_peer(host: str) -> bool:
+    """Only a peer on a private network may assert a forwarded client address."""
+    import ipaddress
+
+    try:
+        address = ipaddress.ip_address(host)
+    except ValueError:
+        return False
+    return (address.is_private or address.is_loopback
+            or address.is_link_local or address.is_reserved)
+
+
 def client_ip(request: Request) -> str:
+    """The caller's address, trusting forwarding headers only from the gateway.
+
+    X-Forwarded-For is attacker-controlled on a direct connection, and every
+    audit record depends on this value, so it is honoured only when the actual
+    peer is on a private network — which is where the Olares gateway sits.
+    """
+    peer = request.client.host if request.client else ""
+    if peer and not _is_trusted_peer(peer):
+        return peer
     forwarded = request.headers.get("x-forwarded-for")
     if forwarded:
-        return forwarded.split(",")[0].strip()
+        candidate = forwarded.split(",")[0].strip()
+        if candidate:
+            return candidate
     real = request.headers.get("x-real-ip")
     if real:
         return real.strip()
-    return request.client.host if request.client else ""
+    return peer
 
 
 def _cert_from_header(request: Request) -> bytes | None:

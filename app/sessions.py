@@ -6,6 +6,14 @@ from typing import Any
 
 from . import audit, db
 from .config import DURABLE_STATES
+
+# States an administrator sets deliberately to stop a session going further.
+# Automatic re-evaluation must not quietly undo them; ingest_confirmed is still
+# kept accurate underneath, so the recorder's contract is unaffected.
+ADMIN_STICKY_STATES = frozenset({
+    "ERROR", "POLICY_BLOCKED", "TRANSCRIPTION_FAILED", "PROCESSING_FAILED",
+    "BOUNDARY_REVIEW_REQUIRED", "PURGED",
+})
 from .util import now_iso
 
 
@@ -111,14 +119,19 @@ def patient_segments(session_id: str) -> list[dict[str, Any]]:
     session = get(session_id)
     if session is None:
         return []
-    boundaries = sorted(
-        {
-            int(e["offset_ms"])
-            for e in events_for(session_id)
-            if e["event"] == "patient_boundary" and e.get("offset_ms") is not None
-        }
-    )
     end = _session_duration_ms(session_id)
+    raw = {
+        int(e["offset_ms"])
+        for e in events_for(session_id)
+        if e["event"] == "patient_boundary" and e.get("offset_ms") is not None
+    }
+    # A boundary at or past the end of the audio (a recorder with a clock or
+    # offset bug) would otherwise produce a segment with a negative length.
+    # Segments are what keep two patients' audio apart, so anything that cannot
+    # describe a real split is discarded rather than emitted.
+    boundaries = sorted(
+        b for b in raw if b > 0 and (end is None or b < end)
+    )
     edges = [0, *boundaries]
     segments: list[dict[str, Any]] = []
     for index, start in enumerate(edges):
@@ -239,9 +252,11 @@ def evaluate(session_id: str, *, conn=None) -> dict[str, Any]:
     if not expected:
         problems.append("manifest lists no chunks")
 
+    sticky = session["state"] in ADMIN_STICKY_STATES
+
     if not complete_requested:
         # Still receiving; nothing to confirm yet.
-        if session["state"] not in ("RECEIVING", "CREATED"):
+        if sticky or session["state"] not in ("RECEIVING", "CREATED"):
             return status_payload(session_id)
         set_state(session_id, "RECEIVING", ingest_confirmed=False, conn=conn)
         return status_payload(session_id)
@@ -249,7 +264,7 @@ def evaluate(session_id: str, *, conn=None) -> dict[str, Any]:
     if problems:
         set_state(
             session_id,
-            "RECEIVING",
+            session["state"] if sticky else "RECEIVING",
             ingest_confirmed=False,
             error_code="MISSING_CHUNKS" if missing else "INCOMPLETE_INGEST",
             error_message="; ".join(problems),
@@ -257,10 +272,10 @@ def evaluate(session_id: str, *, conn=None) -> dict[str, Any]:
         )
         return status_payload(session_id)
 
-    if session["state"] not in DURABLE_STATES:
-        set_state(session_id, "INGESTED", ingest_confirmed=True, conn=conn)
-    else:
+    if sticky or session["state"] in DURABLE_STATES:
         set_state(session_id, session["state"], ingest_confirmed=True, conn=conn)
+    else:
+        set_state(session_id, "INGESTED", ingest_confirmed=True, conn=conn)
     return status_payload(session_id)
 
 
