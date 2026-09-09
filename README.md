@@ -266,6 +266,24 @@ Mistral's own response reports `prompt_audio_seconds`, so the billed quantity is
 the provider's number rather than our estimate. At $0.003 per minute a
 twenty-minute consultation costs six cents to transcribe.
 
+### Providers are tested over a real socket
+
+`tests/test_real_mistral.py` runs the actual `MistralProvider` against a real
+HTTP server, with real encrypted chunks reassembled by `app/audio.py`. Not a
+mock transport, deliberately: httpx picks its encoding when the request is
+*built*, and the first version of this client passed `data=` a list of pairs.
+httpx only treats `data` as form fields when it is a Mapping, so the list was
+taken as a raw body, multipart was skipped, the audio was never attached, and
+it died inside h11 with `sequence item 1: expected a bytes-like object, tuple
+found`. A mock transport would have accepted it; only writing the body to a
+socket does not.
+
+The rule that follows: **a provider client that has never been run against a
+socket does not work yet.** `OurMindProvider` is still in that state — it has
+no such test, because it cannot be exercised without an integration token.
+Treat its first real call as untested code.
+
+
 ## Admin interface
 
 At `/admin/` on port 8081:

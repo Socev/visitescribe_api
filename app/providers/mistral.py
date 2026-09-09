@@ -73,19 +73,27 @@ class MistralProvider:
         if not ok:
             raise ProviderError(why, code="PROVIDER_NOT_CONFIGURED")
 
-        data: list[tuple[str, str]] = [
-            ("model", self.asr_model),
-            ("diarize", "true"),
-        ]
+        # A DICT, never a list of pairs. httpx only treats `data` as form
+        # fields when it is a Mapping; anything else is taken as a raw request
+        # body, the multipart encoding is silently skipped, and the audio is
+        # never sent at all. It fails far downstream, in h11, as
+        # "sequence item 1: expected a bytes-like object, tuple found".
+        # Repeated fields are expressed as a list VALUE, which httpx does
+        # encode as repeats.
+        data: dict[str, Any] = {
+            "model": self.asr_model,
+            "diarize": "true",
+        }
         # Mistral documents timestamp_granularities as incompatible with
         # `language`, so this picks one: an explicit language is worth more for
         # a known-Dutch recording than segment timings are.
         if language:
-            data.append(("language", language))
+            data["language"] = language
         else:
-            data.append(("timestamp_granularities", "segment"))
-        for term in context.get("context_bias") or []:
-            data.append(("context_bias", str(term)))
+            data["timestamp_granularities"] = "segment"
+        bias = [str(term) for term in (context.get("context_bias") or [])]
+        if bias:
+            data["context_bias"] = bias
 
         try:
             with audio.open("rb") as handle:

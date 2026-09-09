@@ -129,6 +129,33 @@ def _claim() -> dict[str, Any] | None:
         return dict(row)
 
 
+def _describe(exc: Exception) -> str:
+    """The message plus where it came from.
+
+    A bare str(exc) can be untraceable: "sequence item 1: expected a bytes-like
+    object, tuple found" came out of h11, three libraries below our own code,
+    and said nothing about which call produced it. The deepest frame plus the
+    deepest frame inside `app/` turns that into something you can open.
+
+    Only exception text and code locations -- no local variables, so no keys,
+    no audio, no patient data.
+    """
+    parts = [f"{type(exc).__name__}: {exc}"]
+    tb = exc.__traceback__
+    deepest = ours = None
+    while tb is not None:
+        frame = tb.tb_frame.f_code
+        deepest = (frame.co_filename, tb.tb_lineno, frame.co_name)
+        if "/app/" in frame.co_filename.replace("\\", "/"):
+            ours = deepest
+        tb = tb.tb_next
+    for label, loc in (("at", deepest), ("via", ours)):
+        if loc and loc != (ours if label == "at" else None):
+            fn = loc[0].rsplit("/", 2)[-2:] 
+            parts.append(f"{label} {'/'.join(fn)}:{loc[1]} in {loc[2]}()")
+    return " | ".join(parts)
+
+
 def _fail(job: dict[str, Any], exc: Exception, retryable: bool) -> None:
     attempts = int(job["attempts"]) + 1
     give_up = (not retryable) or attempts >= MAX_ATTEMPTS
@@ -136,7 +163,7 @@ def _fail(job: dict[str, Any], exc: Exception, retryable: bool) -> None:
         db.execute(
             "UPDATE processing_jobs SET state = 'failed', error = ?, error_code = ?, "
             "finished_at = ?, updated_at = ? WHERE id = ?",
-            (str(exc)[:2000], getattr(exc, "code", "PROVIDER_FAILED"),
+            (_describe(exc)[:2000], getattr(exc, "code", "PROVIDER_FAILED"),
              now_iso(), now_iso(), job["id"]),
         )
         sessions.set_state(
@@ -154,7 +181,7 @@ def _fail(job: dict[str, Any], exc: Exception, retryable: bool) -> None:
         db.execute(
             "UPDATE processing_jobs SET state = 'queued', error = ?, error_code = ?, "
             "next_attempt_at = ?, updated_at = ? WHERE id = ?",
-            (str(exc)[:2000], getattr(exc, "code", "PROVIDER_FAILED"),
+            (_describe(exc)[:2000], getattr(exc, "code", "PROVIDER_FAILED"),
              datetime.fromtimestamp(retry_at, UTC).isoformat().replace("+00:00", "Z"),
              now_iso(), job["id"]),
         )
