@@ -48,6 +48,7 @@ class OurMindProvider:
         self.timeout = float(os.environ.get("VS_OURMIND_TIMEOUT", "120"))
         self.poll_seconds = float(os.environ.get("VS_OURMIND_POLL_SECONDS", "3"))
         self.poll_budget = float(os.environ.get("VS_OURMIND_POLL_BUDGET", "900"))
+        self.language = os.environ.get("VS_OURMIND_LANGUAGE") or "nl-NL"
         self.template_id = os.environ.get("VS_OURMIND_TEMPLATE_ID") or ""
         self.delete_after = (os.environ.get("VS_OURMIND_DELETE_AFTER", "true") or "").lower() \
             in ("1", "true", "yes", "on")
@@ -64,9 +65,13 @@ class OurMindProvider:
         return f"{self.base}/{self.version}/{path.lstrip('/')}"
 
     def _call(self, method: str, path: str, *, json_body: dict | None = None,
-              content: bytes | None = None, content_type: str | None = None,
+              content: Any = None, content_type: str | None = None,
               timeout: float | None = None) -> Any:
-        headers = {"Authorization": f"Bearer {self.token}", "Accept": JSON_API}
+        # Accept-Language decides the language of the report. Dutch is NOT the
+        # system default -- it is what you get by asking for it. Verified
+        # against the documentation after an earlier claim to the contrary.
+        headers = {"Authorization": f"Bearer {self.token}", "Accept": JSON_API,
+                   "Accept-Language": self.language}
         if json_body is not None:
             headers["Content-Type"] = JSON_API
         elif content_type:
@@ -123,9 +128,14 @@ class OurMindProvider:
                 json_body={"data": {"type": "file",
                                     "attributes": {"name": audio.name[:140]}}},
             ))
-            self._call("PATCH", f"consultation/{consultation}/file/{file_id}",
-                       content=audio.read_bytes(), content_type="audio/flac",
-                       timeout=max(self.timeout, 600))
+            # An open handle, not read_bytes(): httpx streams it and still
+            # sends a real Content-Length, so a 45-minute consultation never
+            # sits in memory whole -- which is the entire point of the
+            # streaming reassembly in app/audio.py, and would be undone here.
+            with audio.open("rb") as handle:
+                self._call("PATCH", f"consultation/{consultation}/file/{file_id}",
+                           content=handle, content_type="audio/flac",
+                           timeout=max(self.timeout, 600))
             self._call("POST", f"consultation/{consultation}/file/{file_id}/seal")
 
             transcript = self._await_transcript(consultation)
