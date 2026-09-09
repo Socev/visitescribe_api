@@ -49,9 +49,6 @@ jobs:
     permissions:
       contents: read
       packages: write
-    outputs:
-      digest-amd64: ${{ steps.export.outputs.digest-amd64 }}
-      digest-arm64: ${{ steps.export.outputs.digest-arm64 }}
     steps:
       - uses: actions/checkout@v4
 
