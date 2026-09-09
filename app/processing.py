@@ -143,6 +143,46 @@ def cancel(session_id: str, *, actor: str = "admin") -> int:
 STALE_RUNNING_SECONDS = 1800
 
 
+# The worker is a single task in the pod, and until now it announced itself
+# once at startup and then said nothing. If it stopped -- died, or got wedged
+# waiting on something that never returns -- everything simply sat in the queue
+# and there was no way to tell that from "the provider is slow". So it now
+# records that it is alive, and the admin page and /readyz say so.
+HEARTBEAT_KEY = "worker.heartbeat"
+BUSY_KEY = "worker.busy_since"
+
+
+def beat(busy: str = "") -> None:
+    db.set_meta(HEARTBEAT_KEY, now_iso())
+    db.set_meta(BUSY_KEY, busy)
+
+
+def worker_health() -> dict[str, Any]:
+    """Whether the queue is being drained, and if not, for how long already."""
+    last = db.get_meta(HEARTBEAT_KEY)
+    busy = db.get_meta(BUSY_KEY) or ""
+    waiting = db.query_one(
+        "SELECT COUNT(*) AS n FROM processing_jobs WHERE state = 'queued' "
+        "AND (next_attempt_at IS NULL OR next_attempt_at <= ?)", (now_iso(),))
+    running = db.query_one(
+        "SELECT COUNT(*) AS n FROM processing_jobs WHERE state = 'running'")
+    seen = parse_iso(last) if last else None
+    age = (now() - seen).total_seconds() if seen else None
+    # Twice the poll interval is normal; a job in flight can legitimately take
+    # much longer, so "stalled" only means: not even looking, with work due.
+    stalled = bool(age is not None and age > max(60.0, settings.processing_poll_seconds * 6)
+                   and (waiting["n"] or 0) > 0)
+    return {
+        "last_seen": last,
+        "seconds_since": round(age, 1) if age is not None else None,
+        "busy_with": busy,
+        "queued_due": waiting["n"] or 0,
+        "running": running["n"] or 0,
+        "never_started": last is None,
+        "stalled": stalled,
+    }
+
+
 def requeue_orphans(*, reason: str = "worker restarted") -> int:
     """Put every job that was running back in the queue."""
     rows = db.query("SELECT id, session_id, stage FROM processing_jobs "
@@ -548,7 +588,11 @@ def run_once() -> bool:
     """Run at most one due job. Returns True if it did any work."""
     job = _claim()
     if job is None:
+        beat()
         return False
+    beat(f"{job['stage']} {job['session_id']} ({job['route']})")
+    log.info("job %s: %s %s via %s", job["id"], job["stage"],
+             job["session_id"], job["route"])
     try:
         run_job(job)
     except ProviderError as exc:
@@ -558,6 +602,9 @@ def run_once() -> bool:
     except Exception as exc:  # noqa: BLE001
         log.exception("job %s crashed", job["id"])
         _fail(job, exc, retryable=True)
+    finally:
+        beat()
+        log.info("job %s finished", job["id"])
     return True
 
 

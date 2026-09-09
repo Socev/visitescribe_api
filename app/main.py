@@ -117,7 +117,23 @@ async def _worker_loop() -> None:
     since_sweep = 0.0
     while True:
         try:
-            did_work = await asyncio.to_thread(processing.run_once)
+            # Bounded on purpose. A job that never returns used to take the
+            # whole queue down with it silently: the loop stays awaiting it and
+            # nothing else is ever claimed, which looks exactly like "nothing
+            # is happening". The ceiling is far above any legitimate job --
+            # OurMind polls for a report for up to 15 minutes -- so hitting it
+            # means something is wedged, and the job is left `running` for the
+            # stale sweep to reclaim.
+            did_work = await asyncio.wait_for(
+                asyncio.to_thread(processing.run_once),
+                timeout=processing.STALE_RUNNING_SECONDS,
+            )
+        except asyncio.TimeoutError:
+            log.error("a processing job exceeded %ss and was abandoned by the "
+                      "worker; it will be reclaimed", processing.STALE_RUNNING_SECONDS)
+            did_work = False
+        except asyncio.CancelledError:
+            raise            # shutdown, not an error
         except Exception:  # noqa: BLE001 - the loop must outlive one bad job
             log.exception("processing worker error")
             did_work = False

@@ -95,6 +95,20 @@ def create_app() -> FastAPI:
         else:
             if crypto.active_key() is None:
                 problems.append("no active server key")
+        # The worker lives in this process but off the request path, so its
+        # health was invisible from outside. A dead worker looked exactly like
+        # a slow provider: everything queued, nothing said why.
+        worker = {}
+        try:
+            from . import processing
+
+            worker = processing.worker_health()
+            if worker.get("stalled"):
+                problems.append(
+                    f"processing worker last seen {worker['seconds_since']}s ago "
+                    f"with {worker['queued_due']} job(s) due")
+        except Exception as exc:  # noqa: BLE001
+            problems.append(f"worker health unavailable: {exc}")
         return JSONResponse(
             status_code=200,
             content={
@@ -103,6 +117,7 @@ def create_app() -> FastAPI:
                 "flac_decoder": ("libsndfile" if flacinfo.decoder_available()
                                  else "structural-only"),
                 "problems": problems,
+                "worker": worker,
                 "startup": STARTUP_INFO,
                 "time": now_iso(),
             },

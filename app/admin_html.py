@@ -991,6 +991,29 @@ async function saveNote(key, approve){{
 </script>"""
 
 
+def _worker_banner(w: dict[str, Any] | None) -> str:
+    """Say plainly whether the queue is being drained.
+
+    Until this existed, a worker that had died looked exactly like a provider
+    that was slow: jobs sat in `queued` and nothing anywhere said why.
+    """
+    if not w:
+        return ""
+    if w.get("never_started"):
+        return ('<div class="banner bad">De verwerkings-worker heeft zich nog '
+                'nooit gemeld. Staat VS_PROCESSING_ENABLED aan?</div>')
+    if w.get("stalled"):
+        return (f'<div class="banner bad">De worker heeft zich al '
+                f'{int(w["seconds_since"] or 0)} seconden niet gemeld terwijl er '
+                f'{w["queued_due"]} job(s) klaarstaan. '
+                f'{"Bezig met: " + _e(w["busy_with"]) + "." if w.get("busy_with") else ""} '
+                f'Herstart de app als dit zo blijft.</div>')
+    busy = f' · bezig met {_e(w["busy_with"])}' if w.get("busy_with") else ""
+    return (f'<p class="sub">Worker actief, laatst gezien '
+            f'{int(w.get("seconds_since") or 0)}s geleden{busy}. '
+            f'{w.get("queued_due", 0)} klaar, {w.get("running", 0)} onderhanden.</p>')
+
+
 def render_costs(d: dict[str, Any], who: str) -> str:
     lines = d["costs"]["lines"]
     rows = "".join(
@@ -1026,6 +1049,7 @@ def render_costs(d: dict[str, Any], who: str) -> str:
 
     body = f"""<h1>Verwerking</h1>
 <p class="sub">Wat er verwerkt is, wat het kostte, en welke routes zijn toegestaan.</p>
+{_worker_banner(d.get("worker"))}
 {unpriced_note}
 <div class="grid g4">
   <div class="stat"><div class="k">Kosten totaal</div>

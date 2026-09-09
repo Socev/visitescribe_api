@@ -163,7 +163,9 @@ class Fake(BaseHTTPRequestHandler):
 @pytest.fixture()
 def fake_ourmind(monkeypatch):
     Fake.known_emails = {"dokter@praktijk.nl"}
-    Fake.issued, Fake.mailed, Fake.generate_bodies = set(), [], []
+    # "test-token" stands in for a pod-wide credential; a per-user token is
+    # minted by verify and added to this set when someone signs in.
+    Fake.issued, Fake.mailed, Fake.generate_bodies = {"test-token"}, [], []
     srv = HTTPServer(("127.0.0.1", 0), Fake)
     threading.Thread(target=srv.serve_forever, daemon=True).start()
     base = f"http://127.0.0.1:{srv.server_address[1]}"
@@ -641,3 +643,88 @@ def test_the_status_endpoint_is_scoped_to_the_signed_in_user(site, fake_ourmind,
     other.create(); other.upload_all(); other.complete()
 
     assert site.get(f"/api/stand?opname={other.session_id}").status_code == 404
+
+
+# ---------------------------------------------------------------------------
+# the worker itself
+#
+# Every test so far called processing.run_once() directly, so the loop that
+# actually drains the queue in production had never been run by a test at all.
+# That is the same gap that let the Mistral client ship without ever sending
+# its audio.
+# ---------------------------------------------------------------------------
+
+def test_the_worker_loop_really_drains_the_queue(server, fake_ourmind,
+                                                 monkeypatch):
+    import asyncio
+
+    from app import main, processing
+
+    monkeypatch.setenv("VS_OURMIND_TOKEN", "test-token")
+    server.register_device("visitescribe-001")
+    rec = Recorder(server)
+    rec.add_chunk(seconds=1.0)
+    rec.create(); rec.upload_all(); rec.complete()
+    processing.enqueue(rec.session_id, "ourmind", actor="test")
+
+    async def drive():
+        task = asyncio.create_task(main._worker_loop())
+        for _ in range(100):
+            await asyncio.sleep(0.05)
+            jobs = processing.jobs_for(rec.session_id)
+            if jobs and all(j["state"] in ("done", "failed") for j in jobs):
+                break
+        task.cancel()
+        try:
+            await task
+        except asyncio.CancelledError:
+            pass
+
+    asyncio.run(drive())
+
+    jobs = processing.jobs_for(rec.session_id)
+    assert jobs, "the worker created no jobs"
+    for job in jobs:
+        assert job["state"] == "done", f"{job['stage']}: {job.get('error')}"
+
+
+def test_the_worker_reports_that_it_is_alive(server):
+    from app import processing
+
+    health = processing.worker_health()
+    assert health["never_started"] is True
+    assert health["stalled"] is False        # nothing queued, so not stalled
+
+    processing.beat()
+    health = processing.worker_health()
+    assert health["never_started"] is False
+    assert health["seconds_since"] < 5
+
+
+def test_a_silent_worker_with_work_waiting_is_reported_as_stalled(server,
+                                                                  fake_ourmind,
+                                                                  monkeypatch):
+    """A dead worker used to look exactly like a slow provider."""
+    from app import db, processing
+
+    monkeypatch.setenv("VS_OURMIND_TOKEN", "test-token")
+    server.register_device("visitescribe-001")
+    rec = Recorder(server)
+    rec.add_chunk(seconds=1.0)
+    rec.create(); rec.upload_all(); rec.complete()
+
+    processing.enqueue(rec.session_id, "ourmind", actor="test", force=True)
+
+    # a heartbeat from long ago, with a job due
+    db.set_meta(processing.HEARTBEAT_KEY, "2020-01-01T00:00:00Z")
+    health = processing.worker_health()
+    assert health["queued_due"] >= 1
+    assert health["stalled"] is True
+
+    server.admin_login()
+    page = server.admin.get("/admin/costs").text
+    assert "niet gemeld" in page
+
+    body = server.client.get("/readyz").json()
+    assert body["status"] == "degraded"
+    assert any("worker last seen" in p for p in body["problems"])

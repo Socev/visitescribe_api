@@ -216,6 +216,7 @@ def create_admin_app() -> FastAPI:
         return HTMLResponse(render_costs({
             "costs": processing.cost_summary(),
             "queue": processing.queue_overview(),
+            "worker": processing.worker_health(),
             "policy": routing.describe(),
             "providers": provider_credentials.status(),
             "enabled": settings.processing_enabled,
@@ -347,6 +348,7 @@ def create_admin_app() -> FastAPI:
         guard(request)
         return JSONResponse({
             "queue": processing.queue_overview(),
+            "worker": processing.worker_health(),
             "policy": routing.describe(),
             "providers": provider_credentials.status(),
             "prices": pricing.known_models(),
@@ -688,6 +690,7 @@ def _dashboard_data() -> dict[str, Any]:
         "security_failures": security,
         "flac_decoder": "libsndfile" if flacinfo.decoder_available() else "structural-only",
         "queue": processing.queue_overview(),
+        "worker": processing.worker_health(),
         "costs": processing.cost_summary(),
         "providers": provider_credentials.status(),
         "policy": routing.describe(),
