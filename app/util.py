@@ -112,3 +112,15 @@ def parse_iso(value: str | None) -> datetime | None:
         return dt if dt.tzinfo else dt.replace(tzinfo=UTC)
     except ValueError:
         return None
+
+
+def iso_from_epoch(seconds: float) -> str:
+    """A unix timestamp as the same ISO-8601 shape used everywhere else."""
+    from datetime import UTC, datetime
+
+    return datetime.fromtimestamp(float(seconds), UTC).isoformat().replace("+00:00", "Z")
+
+
+def epoch_from_iso(value: str | None) -> float | None:
+    parsed = parse_iso(value)
+    return parsed.timestamp() if parsed else None

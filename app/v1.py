@@ -1,6 +1,8 @@
 """The /v1 ingest API — the contract the recorder depends on."""
 from __future__ import annotations
 
+import re
+
 import asyncio
 import json
 from typing import Any
@@ -9,7 +11,8 @@ from fastapi import APIRouter, Request, Response
 from fastapi.responses import JSONResponse
 from pydantic import ValidationError
 
-from . import audit, crypto, db, flacinfo, idempotency, ratelimit, sessions, storage
+from . import (audit, crypto, db, flacinfo, idempotency, processing, ratelimit,
+               sessions, storage, users)
 from .auth import DeviceIdentity, authenticate
 from .config import SUPPORTED_MODES, settings
 from .errors import ApiError
@@ -173,11 +176,20 @@ async def create_session(request: Request) -> Response:
             "INVALID_MANIFEST",
             "manifest device_id does not match the authenticated device",
         )
+    # A mode the recorder invents is accepted, not rejected -- a new button on
+    # the hardware (an "MDO", say) must not need a server release to be usable.
+    # It is registered as a recording type, and an unknown type is assumed to
+    # carry patient audio until a human says otherwise, so the routing policy
+    # treats it in the strictest way rather than the loosest. The shape is
+    # still constrained, so a malformed or hostile value cannot become a row.
     if manifest.mode not in SUPPORTED_MODES:
-        raise ApiError(
-            "INVALID_MANIFEST",
-            f"mode must be one of {', '.join(SUPPORTED_MODES)}",
-        )
+        if not re.fullmatch(r"[a-z][a-z0-9_]{2,31}", manifest.mode or ""):
+            raise ApiError(
+                "INVALID_MANIFEST",
+                "mode must be lowercase letters, digits and underscores "
+                f"(3-32 characters), or one of {', '.join(SUPPORTED_MODES)}",
+            )
+        users.ensure_recording_type(manifest.mode)
 
     encryption = manifest.encryption
     if (encryption.algorithm or "").upper() != crypto.AES_ALGORITHM:
@@ -833,6 +845,11 @@ async def complete_session(session_id: str, request: Request) -> Response:
         )
 
     result = sessions.evaluate(session_id)
+    if result.get("ingest_confirmed"):
+        # The recorder is told the audio is safe on the strength of the line
+        # above; anything after it is a convenience and must not be able to
+        # change that answer. maybe_autostart swallows its own failures.
+        processing.maybe_autostart(session_id)
     body = {
         "session_id": session_id,
         "state": result.get("state"),

@@ -16,11 +16,19 @@ _REGISTRY: dict[str, type[Provider]] = {
 }
 
 
-def get(name: str) -> Provider:
+def get(name: str, *, token: str | None = None) -> Provider:
+    """A provider client, optionally acting for one specific user.
+
+    `token` is the signed-in user's own OurMind credential. Providers that do
+    not take one ignore it, so callers do not have to know which is which.
+    """
     cls = _REGISTRY.get(name)
     if cls is None:
         raise ProviderError(f"Onbekende provider {name!r}")
-    return cls()
+    try:
+        return cls(token=token) if token else cls()
+    except TypeError:
+        return cls()
 
 
 def names() -> list[str]:

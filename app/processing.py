@@ -18,7 +18,7 @@ import time
 from pathlib import Path
 from typing import Any
 
-from . import audit, db, pricing, routing, sessions
+from . import audit, db, pricing, routing, sessions, users
 from .config import settings
 from .errors import ApiError
 from .providers import ProviderError, get as get_provider
@@ -54,7 +54,15 @@ def enqueue(session_id: str, route: str, *, actor: str = "admin",
     # that, not from whoever set the route.
     routing.check(session["mode"], route)
 
-    provider = get_provider(route)
+    # Check the credential the job will actually use, which for OurMind is
+    # the owner's own token and not a server-wide one. Checking a different
+    # credential here than the worker uses would accept jobs that can only
+    # fail later, on someone else's behalf.
+    owner = users.owner_of_session(session_id)
+    token = None
+    if owner is not None and route == "ourmind":
+        token = users.access_token(owner["user_id"])
+    provider = get_provider(route, token=token)
     ready, why = provider.configured()
     if not ready:
         raise ApiError("PROVIDER_NOT_CONFIGURED", why)
@@ -221,21 +229,72 @@ def _work_dir(session_id: str) -> Path:
     return settings.data_dir / "work" / session_id
 
 
+def maybe_autostart(session_id: str) -> dict[str, Any] | None:
+    """Send a finished recording on its way if its owner asked for that.
+
+    "Standaard ergens heen" is a per-user, per-recording-type setting, not a
+    server switch: one doctor may want every consultation to go straight to
+    OurMind while meetings wait for a human. It runs on the ingest path, so it
+    must never raise -- a recording that is safely stored is safely stored
+    even if nothing can be done with it yet.
+    """
+    if not settings.auto_process:
+        return None      # administrator has stopped all outbound processing
+    try:
+        session = sessions.get(session_id)
+        if session is None or not session["ingest_confirmed"]:
+            return None
+        if db.query_one("SELECT 1 FROM processing_jobs WHERE session_id = ?",
+                        (session_id,)) is not None:
+            return None
+        owner = users.owner_of_session(session_id)
+        if owner is None or owner["disabled"]:
+            return None
+        rule = users.rule(owner["user_id"], session["mode"])
+        if not rule or not rule["auto"] or not rule["route"]:
+            return None
+        return enqueue(session_id, rule["route"], actor="auto")
+    except Exception as exc:  # noqa: BLE001
+        log.warning("auto-processing %s skipped: %s", session_id, exc)
+        audit.log("processing", "autostart_skipped", "failure",
+                  session_id=session_id, identity="auto",
+                  detail={"reason": str(exc)[:300]})
+        return None
+
+
 def run_job(job: dict[str, Any]) -> None:
     session = sessions.get(job["session_id"])
     if session is None:
         raise ApiError("UNKNOWN_SESSION", "Session disappeared")
     routing.check(session["mode"], job["route"])   # re-checked before anything leaves
-    provider = get_provider(job["route"])
+
+    # Whose recording is this? The device was bound to a user by an admin, and
+    # everything personal follows from that: which OurMind account receives the
+    # audio, whose report allowance it spends, and which template makes the
+    # report. Without an owner we fall back to the pod-wide credential, which
+    # is what a single-user installation has.
+    owner = users.owner_of_session(job["session_id"])
+    token = None
+    if owner is not None and job["route"] == "ourmind":
+        # Deliberately not caught: if the user's session has lapsed the job
+        # must stop and say so, not quietly go out under someone else's token.
+        token = users.access_token(owner["user_id"])
+
+    provider = get_provider(job["route"], token=token)
     ready, why = provider.configured()
     if not ready:
         raise ProviderError(why, code="PROVIDER_NOT_CONFIGURED")
+
+    rule = users.rule(owner["user_id"], session["mode"]) if owner else None
 
     segment_index = job["segment_index"]
     context = {
         "mode": session["mode"],
         "client_status": session["client_status"],
         "segment_index": segment_index,
+        "user_id": owner["user_id"] if owner else None,
+        "template_id": (rule or {}).get("template_id") or "",
+        "template_type": (rule or {}).get("template_type") or "template",
         "language": "nl",
         "privacy_gaps": bool(sessions.privacy_gaps(job["session_id"])),
     }

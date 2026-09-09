@@ -20,6 +20,7 @@ import uvicorn
 from . import processing
 from .admin_app import create_admin_app
 from .api_app import create_app
+from .user_app import create_user_app
 from .bootstrap import initialise
 from .config import settings
 
@@ -120,6 +121,11 @@ async def _run() -> None:
         _server(api, settings.api_port, "ingest-api"),
         _server(admin, settings.admin_port, "admin"),
     ]
+    if settings.user_port:
+        # A third socket for the doctors' own site. Same reasoning as the
+        # admin split: the public ingest entrance has no route here, and this
+        # app has none to the admin interface.
+        servers.append(_server(create_user_app(), settings.user_port, "user-site"))
     if settings.mtls_port:
         extra = _mtls_server(create_app())
         if extra is not None:

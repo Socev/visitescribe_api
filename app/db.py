@@ -271,6 +271,75 @@ CREATE TABLE IF NOT EXISTS provider_credentials (
     updated_at TEXT NOT NULL
 );
 
+-- A person who owns recordings. The key is their OurMind e-mail address,
+-- because that is literally the doctor's id in OurMind's API (`data.id` on
+-- /me is the address), so there is nothing to map between the two systems.
+CREATE TABLE IF NOT EXISTS users (
+    user_id       TEXT PRIMARY KEY,
+    email         TEXT NOT NULL UNIQUE,
+    display_name  TEXT NOT NULL DEFAULT '',
+    org_name      TEXT NOT NULL DEFAULT '',
+    disabled      INTEGER NOT NULL DEFAULT 0,
+    created_at    TEXT NOT NULL,
+    updated_at    TEXT NOT NULL,
+    last_seen_at  TEXT
+);
+
+-- The user's own OurMind credentials, so their audio goes to their own
+-- account and counts against their own report quota. Encrypted at rest.
+CREATE TABLE IF NOT EXISTS user_tokens (
+    user_id        TEXT PRIMARY KEY REFERENCES users(user_id) ON DELETE CASCADE,
+    access_token   TEXT NOT NULL,
+    refresh_token  TEXT NOT NULL DEFAULT '',
+    expires_at     TEXT,
+    updated_at     TEXT NOT NULL
+);
+
+-- Sign-in sessions for the user-facing site. Separate from admin_sessions:
+-- a user must never be able to reach the admin interface with their cookie.
+CREATE TABLE IF NOT EXISTS user_sessions (
+    token_hash TEXT PRIMARY KEY,
+    user_id    TEXT NOT NULL REFERENCES users(user_id) ON DELETE CASCADE,
+    created_at TEXT NOT NULL,
+    expires_at TEXT NOT NULL
+);
+
+-- Pending e-mail codes. We never see the code itself -- Supabase mails it --
+-- this only remembers that a login for this address is in progress, so the
+-- verify step cannot be used to fish for which addresses exist.
+CREATE TABLE IF NOT EXISTS login_attempts (
+    email      TEXT PRIMARY KEY,
+    started_at TEXT NOT NULL,
+    attempts   INTEGER NOT NULL DEFAULT 0
+);
+
+-- What kinds of recording exist. A TABLE and not an enum on purpose: the
+-- recorder decides what it sends, and a future button on the hardware (an
+-- "MDO", say) must show up here and in every settings page without a code
+-- change. Unknown modes arriving from a recorder are added automatically.
+CREATE TABLE IF NOT EXISTS recording_types (
+    mode        TEXT PRIMARY KEY,
+    title       TEXT NOT NULL,
+    description TEXT NOT NULL DEFAULT '',
+    patient_audio INTEGER NOT NULL DEFAULT 1,
+    position    INTEGER NOT NULL DEFAULT 100,
+    builtin     INTEGER NOT NULL DEFAULT 0,
+    created_at  TEXT NOT NULL
+);
+
+-- What happens to a recording of a given kind, per user. Absent = ask.
+CREATE TABLE IF NOT EXISTS routing_rules (
+    user_id       TEXT NOT NULL REFERENCES users(user_id) ON DELETE CASCADE,
+    mode          TEXT NOT NULL,
+    route         TEXT NOT NULL DEFAULT '',
+    template_id   TEXT NOT NULL DEFAULT '',
+    template_type TEXT NOT NULL DEFAULT '',
+    template_title TEXT NOT NULL DEFAULT '',
+    auto          INTEGER NOT NULL DEFAULT 0,
+    updated_at    TEXT NOT NULL,
+    PRIMARY KEY (user_id, mode)
+);
+
 CREATE TABLE IF NOT EXISTS admin_sessions (
     token_hash TEXT PRIMARY KEY,
     created_at TEXT NOT NULL,
@@ -325,8 +394,51 @@ def get_conn() -> sqlite3.Connection:
         with _init_lock:
             if not _initialised:
                 conn.executescript(SCHEMA)
+                _add_missing_columns(conn)
+                _seed_recording_types(conn)
                 _initialised = True
     return conn
+
+
+# Columns added to a table that already exists in someone's database.
+# CREATE TABLE IF NOT EXISTS cannot do this, and there is a live installation
+# with real recordings in it, so the schema has to grow without a rebuild.
+ADDED_COLUMNS: tuple[tuple[str, str, str], ...] = (
+    ("devices", "user_id", "TEXT"),
+)
+
+
+def _add_missing_columns(conn: sqlite3.Connection) -> None:
+    for table, column, decl in ADDED_COLUMNS:
+        have = {r["name"] for r in conn.execute(f"PRAGMA table_info({table})")}
+        if column not in have:
+            conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} {decl}")
+    conn.commit()
+
+
+# The modes the recorder ships with today. Seeded rather than hardcoded, so a
+# new one can arrive from a recorder -- or be added by hand -- without a
+# release. `patient_audio` marks the kinds that carry patient voices, which is
+# what the provider policy is allowed to reason about.
+BUILTIN_RECORDING_TYPES: tuple[tuple[str, str, str, int, int], ...] = (
+    ("single_patient", "Consult", "Eén patiënt, één opname.", 1, 10),
+    ("multi_patient", "Spreekuur", "Meerdere patiënten achter elkaar; "
+     "wordt per patiënt gesplitst en nooit samengevoegd.", 1, 20),
+    ("meeting", "Vergadering", "Geen patiëntencontact.", 0, 30),
+)
+
+
+def _seed_recording_types(conn: sqlite3.Connection) -> None:
+    from .util import now_iso
+
+    for mode, title, description, patient_audio, position in BUILTIN_RECORDING_TYPES:
+        conn.execute(
+            "INSERT INTO recording_types(mode, title, description, patient_audio, "
+            "position, builtin, created_at) VALUES(?,?,?,?,?,1,?) "
+            "ON CONFLICT(mode) DO NOTHING",
+            (mode, title, description, patient_audio, position, now_iso()),
+        )
+    conn.commit()
 
 
 @contextmanager

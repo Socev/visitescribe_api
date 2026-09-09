@@ -17,7 +17,7 @@ from fastapi import FastAPI, Request, Response
 from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse, StreamingResponse
 
 from . import (__version__, adminauth, audit, crypto, db, flacinfo, pricing,
-               processing, routing, sessions, storage)
+               processing, routing, sessions, storage, users)
 from .providers import credentials as provider_credentials
 from .providers import get as get_provider
 from .admin_html import (
@@ -30,6 +30,7 @@ from .admin_html import (
     render_login,
     render_session_detail,
     render_sessions,
+    render_users,
 )
 from .auth import create_device
 from .bootstrap import STARTUP_INFO, STARTUP_PROBLEMS, initialise
@@ -157,6 +158,35 @@ def create_admin_app() -> FastAPI:
         if isinstance(who, RedirectResponse):
             return who
         return HTMLResponse(render_devices(_devices_data(), who))
+
+    @app.get("/admin/users", response_class=HTMLResponse, include_in_schema=False)
+    async def users_page(request: Request):  # noqa: ANN202
+        who = html_guard(request)
+        if isinstance(who, RedirectResponse):
+            return who
+        return HTMLResponse(render_users(_users_data(), who))
+
+    @app.post("/admin/api/users", include_in_schema=False)
+    async def create_user(request: Request):  # noqa: ANN202
+        require_admin(request)
+        body = await request.json()
+        user = users.create(str(body.get("email") or ""),
+                            display_name=str(body.get("display_name") or ""))
+        return JSONResponse({"user": user}, status_code=201)
+
+    @app.post("/admin/api/users/{user_id}/enabled", include_in_schema=False)
+    async def set_user_enabled(user_id: str, request: Request):  # noqa: ANN202
+        require_admin(request)
+        body = await request.json()
+        users.set_disabled(user_id, not bool(body.get("enabled", True)))
+        return JSONResponse({"ok": True})
+
+    @app.post("/admin/api/devices/{device_id}/owner", include_in_schema=False)
+    async def bind_device(device_id: str, request: Request):  # noqa: ANN202
+        require_admin(request)
+        body = await request.json()
+        users.bind_device(device_id, str(body.get("user_id") or "") or None)
+        return JSONResponse({"ok": True})
 
     @app.get("/admin/devices/{device_id}", response_class=HTMLResponse,
              include_in_schema=False)
@@ -759,6 +789,14 @@ def _session_detail(session_id: str) -> dict[str, Any] | None:
     }
 
 
+def _users_data() -> dict[str, Any]:
+    rows = users.listing()
+    for row in rows:
+        row["devices"] = users.devices_of(row["user_id"])
+        row["token"] = users.token_status(row["user_id"])
+    return {"users": rows, "unbound": users.unbound_devices()}
+
+
 def _devices_data() -> dict[str, Any]:
     devices = []
     for r in db.query("SELECT * FROM devices ORDER BY device_id"):
@@ -769,6 +807,9 @@ def _devices_data() -> dict[str, Any]:
             "FROM sessions WHERE device_id = ?", (item["device_id"],))
         item["sessions"] = int(counts["n"]) if counts else 0
         item["sessions_confirmed"] = int(counts["ok"] or 0) if counts else 0
+        owner = users.get(item["user_id"]) if item.get("user_id") else None
+        item["owner_email"] = owner["email"] if owner else ""
+        item["owner_name"] = (owner or {}).get("display_name") or ""
         devices.append(item)
     windows = {r["device_id"]: r["expires_at"] for r in db.query(
         "SELECT * FROM enrolment_windows")}

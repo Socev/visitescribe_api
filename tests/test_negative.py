@@ -137,13 +137,37 @@ def test_wrong_schema_version(server):
     assert resp.json()["error"]["code"] == "INVALID_SCHEMA_VERSION"
 
 
-def test_unsupported_mode(server):
+def test_a_malformed_mode_is_still_rejected(server):
     server.register_device("visitescribe-001")
-    rec = Recorder(server, mode="karaoke")
+    for bad in ("Karaoke", "ka", "with spaces", "x" * 40, "../etc", ""):
+        rec = Recorder(server, mode=bad)
+        rec.add_chunk(seconds=0.2)
+        resp = rec.create()
+        assert resp.status_code == 422, bad
+        assert resp.json()["error"]["code"] == "INVALID_MANIFEST"
+
+
+def test_a_new_recording_type_is_accepted_and_registered(server):
+    """Room for a future button on the recorder.
+
+    A mode the server has never heard of is not a client error -- the hardware
+    is allowed to grow without waiting for a server release. It is registered
+    as a recording type, and registered as CARRYING PATIENT AUDIO, so the
+    routing policy treats the unknown case in the strictest way rather than
+    the loosest.
+    """
+    from app import routing, users
+
+    server.register_device("visitescribe-001")
+    rec = Recorder(server, mode="mdo")
     rec.add_chunk(seconds=0.2)
-    resp = rec.create()
-    assert resp.status_code == 422
-    assert resp.json()["error"]["code"] == "INVALID_MANIFEST"
+    assert rec.create().status_code == 201
+
+    types = {t["mode"]: t for t in users.recording_types()}
+    assert "mdo" in types
+    assert types["mdo"]["builtin"] == 0
+    assert types["mdo"]["patient_audio"] == 1
+    assert routing.carries_patient_audio("mdo") is True
 
 
 def test_bad_rsa_key_wrap(server):

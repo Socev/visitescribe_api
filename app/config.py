@@ -33,6 +33,8 @@ class Settings:
     # --- network -------------------------------------------------------
     api_port: int = field(default_factory=lambda: _i("VS_API_PORT", 8080))
     admin_port: int = field(default_factory=lambda: _i("VS_ADMIN_PORT", 8081))
+    # The doctors' own site. 0 switches it off entirely.
+    user_port: int = field(default_factory=lambda: _i("VS_USER_PORT", 8082))
     bind_host: str = field(default_factory=lambda: _s("VS_BIND_HOST", "0.0.0.0"))
 
     # Optional direct-TLS ingest listener with real mTLS (for LAN / exposePort
@@ -100,7 +102,12 @@ class Settings:
     processing_poll_seconds: float = field(
         default_factory=lambda: float(_i("VS_PROCESSING_POLL_SECONDS", 5)))
     default_route: str = field(default_factory=lambda: _s("VS_DEFAULT_ROUTE", ""))
-    auto_process: bool = field(default_factory=lambda: _b("VS_AUTO_PROCESS", False))
+    # A kill switch, NOT the enable. Whether a recording is sent on by itself
+    # is the user's own per-recording-type setting; this only exists so an
+    # administrator can stop all outbound processing at once. Defaulting it to
+    # off would make every user's "meteen versturen" checkbox silently do
+    # nothing, which is exactly the kind of trap this codebase keeps finding.
+    auto_process: bool = field(default_factory=lambda: _b("VS_AUTO_PROCESS", True))
 
     public_base_url: str = field(default_factory=lambda: _s("VS_PUBLIC_BASE_URL", ""))
     log_level: str = field(default_factory=lambda: _s("VS_LOG_LEVEL", "info"))

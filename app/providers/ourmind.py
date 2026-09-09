@@ -41,8 +41,12 @@ TERMINAL_BAD = ("failed", "timed_out")
 class OurMindProvider:
     name = "ourmind"
 
-    def __init__(self) -> None:
-        self.token = credentials.secret("ourmind")
+    def __init__(self, token: str | None = None) -> None:
+        # A per-user token when we have one, so a recording lands in that
+        # doctor's own OurMind account and counts against their own report
+        # allowance. The stored server-wide credential is only a fallback for
+        # a single-user installation.
+        self.token = token or credentials.secret("ourmind")
         self.base = (os.environ.get("VS_OURMIND_BASE_URL") or DEFAULT_BASE).rstrip("/")
         self.version = os.environ.get("VS_OURMIND_API_VERSION") or DEFAULT_VERSION
         self.timeout = float(os.environ.get("VS_OURMIND_TIMEOUT", "120"))
@@ -56,10 +60,56 @@ class OurMindProvider:
     # -- plumbing --------------------------------------------------------
     def configured(self) -> tuple[bool, str]:
         if not self.token:
-            return (False, "Geen OurMind-token opgeslagen. Log in met de e-mailcode "
-                           "en sla het token op, of vraag OurMind om een "
-                           "integratietoken.")
+            return (False, "Niet ingelogd bij OurMind. Log in op de gebruikerssite "
+                           "met de code die je per e-mail krijgt.")
         return (True, "")
+
+    # -- who this token belongs to, and what it may use ------------------
+    def me(self) -> dict[str, Any]:
+        """The doctor behind this token: name, organisation, report quota.
+
+        OurMind's identifier for a doctor IS their e-mail address, so this is
+        also how a token is tied to a user in our own database.
+        """
+        payload = self._call("GET", "me") or {}
+        data = payload.get("data") or {}
+        attrs = data.get("attributes") or {}
+        org = attrs.get("org") or {}
+        return {
+            "email": attrs.get("email") or data.get("id") or "",
+            "name": attrs.get("name") or "",
+            "org_name": (org or {}).get("name") or "",
+            "plan": attrs.get("plan") or "",
+            "language": attrs.get("language") or "",
+            "monthly_reports": attrs.get("monthly_reports"),
+            "reports_left": attrs.get("reports_left"),
+            "default_template": attrs.get("template") or None,
+        }
+
+    def templates(self) -> list[dict[str, Any]]:
+        """Every template this doctor can use: system, personal and shared.
+
+        `/me/templates/all` rather than `/templates`, which is system-only and
+        would silently hide the practice's own templates.
+        """
+        payload = self._call("GET", "me/templates/all") or {}
+        out = []
+        for item in payload.get("data") or []:
+            attrs = item.get("attributes") or {}
+            if attrs.get("available") is False:
+                continue
+            out.append({
+                # A string here and an integer in the generate body. Their
+                # spec really is asymmetric; the cast happens at use.
+                "id": str(item.get("id") or ""),
+                "type": item.get("type") or "template",
+                "title": attrs.get("title") or "(zonder titel)",
+                "language": attrs.get("language") or "",
+                "slug": attrs.get("slug") or "",
+                "has_codes": bool(attrs.get("has_codes")),
+            })
+        out.sort(key=lambda t: (t["title"] or "").lower())
+        return out
 
     def _url(self, path: str) -> str:
         return f"{self.base}/{self.version}/{path.lstrip('/')}"
@@ -164,9 +214,27 @@ class OurMindProvider:
 
         body: dict[str, Any] = {"data": {"type": "generate_reports",
                                          "attributes": {"safe_mode": False}}}
-        if self.template_id:
-            body["data"]["attributes"]["template"] = {
-                "id": int(self.template_id), "type": "template"}
+        # The template the user chose for this KIND of recording, falling back
+        # to the pod-wide default and then to whatever OurMind has set as the
+        # doctor's own default. Note the asymmetry in their API: the listing
+        # gives ids as strings ("13"), the generate body wants an integer.
+        chosen_id = str(context.get("template_id") or self.template_id or "")
+        chosen_type = context.get("template_type") or "template"
+        if chosen_id:
+            if chosen_type == "shared_template":
+                # Their generate endpoint only accepts template|doctor_template.
+                # How to generate directly from a shared template is not
+                # documented, so rather than guess at an id that means
+                # something else, say so.
+                raise ProviderError(
+                    "Dit is een gedeeld template. OurMind accepteert bij het "
+                    "genereren alleen eigen of systeemtemplates; kloon het "
+                    "eerst in OurMind en kies daarna de kopie.")
+            try:
+                body["data"]["attributes"]["template"] = {
+                    "id": int(chosen_id), "type": chosen_type}
+            except (TypeError, ValueError):
+                raise ProviderError(f"Ongeldig template-id {chosen_id!r}") from None
 
         self._call("POST", f"consultation/{consultation}/reports/generate",
                    json_body=body)
@@ -190,7 +258,7 @@ class OurMindProvider:
             body=text,
             title=attrs.get("title"),
             model="ourmind",
-            template=str(attrs.get("template_id") or self.template_id or ""),
+            template=str(attrs.get("template_id") or chosen_id or ""),
             codes=attrs.get("codes") or [],
             # OurMind bills a monthly report allowance rather than per call;
             # the consumed count is read separately from GET /me.

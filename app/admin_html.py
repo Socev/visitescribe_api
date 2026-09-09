@@ -142,6 +142,7 @@ def layout(title: str, body: str, active: str = "", who: str = "") -> str:
         ("dashboard", "/admin/", "Overview"),
         ("sessions", "/admin/sessions", "Sessions"),
         ("devices", "/admin/devices", "Devices"),
+        ("users", "/admin/users", "Gebruikers"),
         ("costs", "/admin/costs", "Verwerking"),
         ("keys", "/admin/keys", "Keys"),
         ("audit", "/admin/audit", "Audit"),
@@ -1039,3 +1040,84 @@ async function checkQuota(){{
 }}
 </script>"""
     return layout("Verwerking", body, "costs", who)
+
+
+def render_users(d: dict[str, Any], who: str) -> str:
+    """Users, and which recorders belong to whom.
+
+    Binding a device to a user is what makes everything downstream personal:
+    whose OurMind account receives the audio, whose report allowance it spends,
+    and which template makes the report. It is an admin act because a recorder
+    is a physical object handed to a person -- the coupling is made by whoever
+    hands it over, not claimed by whoever is holding it.
+    """
+    def user_options(selected: str = "") -> str:
+        out = ['<option value="">— niemand —</option>']
+        for u in d["users"]:
+            sel = " selected" if u["user_id"] == selected else ""
+            label = u["display_name"] or u["email"]
+            out.append(f'<option value="{_e(u["user_id"])}"{sel}>{_e(label)}</option>')
+        return "".join(out)
+
+    rows = []
+    for u in d["users"]:
+        token = u["token"]
+        if not token["present"]:
+            chip = '<span class="chip">niet ingelogd</span>'
+        elif token["expired"] and not token.get("refreshable"):
+            chip = '<span class="chip bad">sessie verlopen</span>'
+        else:
+            chip = '<span class="chip ok">OurMind gekoppeld</span>'
+        devices = "".join(
+            f"""<div style="display:flex;gap:8px;align-items:center;margin-top:6px">
+<code>{_e(dev['device_id'])}</code>
+<button class="link" onclick="bindDevice('{_e(dev['device_id'])}','')">loskoppelen</button>
+</div>""" for dev in u["devices"]) or '<div class="muted">nog geen recorder</div>'
+        rows.append(f"""<div class="panel">
+<div style="display:flex;gap:12px;align-items:flex-start;flex-wrap:wrap">
+<div style="flex:1;min-width:220px">
+  <div style="font-weight:600">{_e(u['display_name'] or u['email'])}</div>
+  <div class="muted">{_e(u['email'])}{' · ' + _e(u['org_name']) if u['org_name'] else ''}</div>
+  <div style="margin-top:8px">{chip}
+    {'<span class="chip bad">uitgeschakeld</span>' if u['disabled'] else ''}</div>
+</div>
+<div style="flex:1;min-width:220px"><h3>Recorders</h3>{devices}</div>
+<div><button onclick="api('/admin/api/users/{_e(u['user_id'])}/enabled',
+  {{method:'POST',body:JSON.stringify({{enabled:{'false' if not u['disabled'] else 'true'}}})}})
+  .then(()=>location.reload())">{'Inschakelen' if u['disabled'] else 'Uitschakelen'}</button></div>
+</div></div>""")
+
+    unbound = "".join(f"""<div class="typerow" style="display:flex;gap:10px;
+align-items:center;padding:8px 0;border-top:1px solid var(--line)">
+<code style="flex:1;white-space:nowrap">{_e(dev['device_id'])}</code>
+<select id="bind__{_e(dev['device_id'])}">{user_options()}</select>
+<button onclick="bindDevice('{_e(dev['device_id'])}',
+  document.getElementById('bind__{_e(dev['device_id'])}').value)">Koppelen</button>
+</div>""" for dev in d["unbound"])
+    unbound_panel = f"""<div class="panel"><h2>Recorders zonder gebruiker</h2>
+<p class="sub">Een opname van een ongekoppelde recorder komt binnen en blijft
+staan: er is niemand van wie het OurMind-account gebruikt kan worden.</p>
+{unbound or '<div class="muted">Alle recorders zijn gekoppeld.</div>'}</div>"""
+
+    body = f"""<h1>Gebruikers</h1>
+<p class="sub">Een gebruiker logt in met het e-mailadres van het eigen
+OurMind-account. Koppel daarna een of meer recorders.</p>
+<div class="panel"><h2>Gebruiker toevoegen</h2>
+<div style="display:flex;gap:10px;flex-wrap:wrap;align-items:end">
+<div style="flex:1;min-width:240px"><label>E-mailadres bij OurMind</label>
+<input id="newEmail" type="email" placeholder="dokter@praktijk.nl"></div>
+<div style="flex:1;min-width:180px"><label>Naam (optioneel)</label>
+<input id="newName" placeholder="wordt anders overgenomen van OurMind"></div>
+<button onclick="api('/admin/api/users',{{method:'POST',body:JSON.stringify(
+  {{email:document.getElementById('newEmail').value,
+    display_name:document.getElementById('newName').value}})}})
+  .then(()=>location.reload())">Toevoegen</button></div></div>
+{unbound_panel}
+{''.join(rows) or '<div class="panel"><div class="muted">Nog geen gebruikers.</div></div>'}
+<script>
+function bindDevice(deviceId, userId){{
+  api('/admin/api/devices/'+encodeURIComponent(deviceId)+'/owner',
+      {{method:'POST',body:JSON.stringify({{user_id:userId}})}}).then(()=>location.reload());
+}}
+</script>"""
+    return layout("Users", body, "users", who)

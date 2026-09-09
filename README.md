@@ -204,6 +204,52 @@ changes that if a later processing stage needs it.
 
 ---
 
+## The user-facing site
+
+A third ASGI app on a third port (8082), behind a third private Olares
+entrance. Separation by port, not by path: the public ingest entrance has no
+route to it, and it has none to the admin interface.
+
+**Signing in is the OurMind sign-in.** OurMind issues no tokens of its own --
+their documentation delegates authentication to a Supabase instance at
+`auth.ourmind.ai` and shows a server-side example doing exactly what this
+does: ask for a code by e-mail, exchange the code for a token. That single act
+establishes who is looking at the page *and* hands over the credential used to
+send that person's audio to their own OurMind account, counted against their
+own report allowance. There is no shared credential standing in for everybody.
+
+The browser cookie and the OurMind token are deliberately separate. The cookie
+says "this browser is Marieke"; the token says "act as Marieke at OurMind". A
+stolen cookie cannot be replayed against OurMind, and an expired OurMind token
+signs you out of OurMind rather than out of this site.
+
+A valid OurMind account is not by itself an account here: an admin creates the
+user and binds one or more recorders to them. That binding is the whole
+authorisation model — every read on the site joins through `devices.user_id`,
+so a missing filter is a missing join and fails loudly rather than showing
+someone else's consultations.
+
+### Recording types are rows, not an enum
+
+`recording_types` is a table. A mode the server has never seen — a future
+"MDO" button on the recorder — is accepted, registered, and appears in every
+settings page without a release. It is registered as **carrying patient
+audio**, so the unknown case gets the strictest routing rule rather than the
+loosest, and a human can reclassify it afterwards.
+
+Each user maps each type to a provider and, for OurMind, a report template:
+*Vergadering → OurMind → vergadertemplate*. "Meteen versturen" is per type and
+per user. `VS_AUTO_PROCESS` is a kill switch that defaults to **on** — making
+it the enable would have meant every user's checkbox silently did nothing.
+
+### Secrets are encrypted at rest
+
+Provider API keys and each user's OurMind token are sealed with a key in the
+0700 key directory (`app/secretbox.py`), so a copied database is worthless on
+its own. A modest guarantee, deliberately: anything that can read the whole
+appData directory can read both. What it covers is the realistic case — a
+backup, an export, a support dump.
+
 ## Processing
 
 A session that reaches `INGESTED` can be handed to a provider. This runs in the

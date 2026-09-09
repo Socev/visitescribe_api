@@ -84,13 +84,48 @@ def _ingested(server, mode="single_patient", chunks=2, boundaries=None):
 # routing policy
 # ---------------------------------------------------------------------------
 
-def test_meeting_audio_may_not_go_to_ourmind(server):
+def test_a_meeting_may_now_go_to_ourmind(server):
+    """Deliberately widened.
+
+    A meeting could not go to OurMind while OurMind meant "one consultation of
+    one patient". With report templates it can: a meeting sent with a meeting
+    template is a report of a meeting. Opened at David's explicit instruction,
+    so this test states the new rule rather than guarding the old one. It
+    fails later, on credentials, not on the policy.
+    """
     rec = _ingested(server, mode="meeting")
     server.admin_login()
     resp = server.admin.post(f"/admin/api/sessions/{rec.session_id}/processing",
                              json={"route": "ourmind"})
-    assert resp.status_code == 403
-    assert resp.json()["error"]["code"] == "ROUTE_NOT_ALLOWED"
+    assert resp.json().get("error", {}).get("code") != "ROUTE_NOT_ALLOWED"
+
+
+def test_a_provider_barred_from_patient_audio_still_cannot_get_it(server,
+                                                                  monkeypatch):
+    """The mechanism did not go away with the meeting restriction.
+
+    Widening one rule must not quietly remove the guard rail. A provider that
+    declares it may not receive patient audio is refused for a consultation
+    and accepted for a meeting -- which is the whole point of the flag.
+    """
+    from app import routing
+
+    monkeypatch.setitem(routing.PROVIDER_PATIENT_AUDIO, "mistral", False)
+
+    with pytest.raises(Exception) as caught:
+        routing.check("single_patient", "mistral")
+    assert "mag niet naar" in str(caught.value)
+
+    routing.check("meeting", "mistral")      # no patients in it: fine
+
+
+def test_an_unknown_recording_type_fails_closed(server, monkeypatch):
+    """A mode nobody has declared is assumed to carry patient audio."""
+    from app import routing
+
+    monkeypatch.setitem(routing.PROVIDER_PATIENT_AUDIO, "mistral", False)
+    with pytest.raises(Exception):
+        routing.check("mdo_button_we_have_never_seen", "mistral")
 
 
 def test_patient_audio_may_go_to_ourmind(server):
@@ -114,17 +149,18 @@ def test_retired_routes_explain_themselves(server, route):
     assert len(resp.json()["error"]["message"]) > 20
 
 
-def test_policy_is_rechecked_in_the_worker(server, fake_route):
-    """Even if a job somehow names a forbidden route, nothing leaves the box."""
+def test_policy_is_rechecked_in_the_worker(server, fake_route, monkeypatch):
+    """A job accepted under one policy must not run under a later one."""
     import app.processing as processing
+    from app import routing
 
-    rec = _ingested(server, mode="meeting")
+    rec = _ingested(server, mode="single_patient")
     server.admin_login()
     server.admin.post(f"/admin/api/sessions/{rec.session_id}/processing",
                       json={"route": "mistral"})
-    # Rewrite the queued job to a route the policy forbids for a meeting.
-    server.db.execute("UPDATE processing_jobs SET route = 'ourmind' WHERE session_id = ?",
-                      (rec.session_id,))
+    # Make the queued route forbidden after the job was accepted, exactly as a
+    # policy change under a waiting job would.
+    monkeypatch.setitem(routing.PROVIDER_PATIENT_AUDIO, "mistral", False)
     processing.run_once()
     job = processing.jobs_for(rec.session_id)[0]
     assert job["state"] == "failed"
@@ -379,10 +415,13 @@ def test_credentials_are_never_echoed_back(server):
 def test_processing_overview_reports_the_policy(server):
     server.admin_login()
     data = server.admin.get("/admin/api/processing").json()
-    policy = {p["mode"]: p["allowed"] for p in data["policy"]}
-    assert policy["meeting"] == ["mistral"]
-    assert policy["single_patient"] == ["mistral", "ourmind"]
-    assert policy["multi_patient"] == ["mistral", "ourmind"]
+    policy = {p["mode"]: p for p in data["policy"]}
+    assert policy["meeting"]["allowed"] == ["mistral", "ourmind"]
+    assert policy["single_patient"]["allowed"] == ["mistral", "ourmind"]
+    # The table now says WHY, not just what: whether the kind carries patients
+    # is the input the rule actually reasons about.
+    assert policy["single_patient"]["patient_audio"] is True
+    assert policy["meeting"]["patient_audio"] is False
 
 
 def test_processing_pages_render(server, fake_route):
@@ -410,9 +449,17 @@ def test_processing_pages_render(server, fake_route):
     assert "Traceback" not in detail.text
 
 
-def test_a_meeting_offers_only_the_allowed_route_in_the_ui(server):
-    rec = _ingested(server, mode="meeting")
+def test_the_ui_offers_exactly_the_allowed_routes(server, monkeypatch):
+    """The picker is generated from the policy, not written out by hand."""
+    from app import routing
+
+    rec = _ingested(server, mode="single_patient")
     server.admin_login()
+    page = server.admin.get(f"/admin/sessions/{rec.session_id}").text
+    assert '<option value="mistral">' in page
+    assert '<option value="ourmind">' in page
+
+    monkeypatch.setitem(routing.PROVIDER_PATIENT_AUDIO, "ourmind", False)
     page = server.admin.get(f"/admin/sessions/{rec.session_id}").text
     assert '<option value="mistral">' in page
     assert '<option value="ourmind">' not in page
