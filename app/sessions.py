@@ -110,6 +110,92 @@ def _session_duration_ms(session_id: str) -> int | None:
     return total if any_known else None
 
 
+# How far a converted boundary may be from a chunk start before we stop
+# believing the recorder's promise that a new patient begins a new chunk.
+SNAP_TOLERANCE_MS = 3000
+
+
+def _snap_to_chunk(offset_ms: int, edges: list[int],
+                   taken: set[int] | None = None) -> int:
+    """Move a boundary onto the chunk start it is obviously meant to be.
+
+    The recorder starts a new chunk at every patient boundary, so the true
+    split is always a chunk start. Snapping removes the residual drift between
+    the recorder's clock and the decoded audio, and keeps a split from landing
+    in the middle of a chunk, where it would cut one patient's audio in half
+    and give the front of it to the previous patient.
+
+    Two things it must never do, both of which MERGE two patients into one
+    segment -- the one outcome this whole mechanism exists to prevent:
+
+    * snap to 0, which would fold the first patient into the second;
+    * snap onto a position another boundary already occupies.
+
+    In either case, and beyond the tolerance, the arithmetic stands. A split
+    that is a little early or late is a wrong timestamp; a merge puts two
+    people's consultations in one note.
+    """
+    if not edges:
+        return offset_ms
+    taken = taken or set()
+    candidates = [e for e in edges if e > 0 and e not in taken]
+    if not candidates:
+        return offset_ms
+    nearest = min(candidates, key=lambda e: abs(e - offset_ms))
+    return nearest if abs(nearest - offset_ms) <= SNAP_TOLERANCE_MS else offset_ms
+
+
+def chunk_edges(session_id: str) -> list[int]:
+    """Where each chunk starts, in AUDIO milliseconds.
+
+    The recorder is documented to start a new chunk at every patient
+    boundary, so these are the only places a segment split can be exactly
+    right.
+    """
+    edges: list[int] = []
+    running = 0
+    for row in db.query(
+        "SELECT flac_json FROM chunks WHERE session_id = ? ORDER BY sequence",
+        (session_id,),
+    ):
+        edges.append(running)
+        try:
+            info = json.loads(row["flac_json"] or "{}")
+        except (ValueError, TypeError):
+            info = {}
+        running += int(info.get("duration_ms") or 0)
+    return edges
+
+
+def to_audio_ms(offset_ms: int, gaps: list[dict[str, Any]]) -> int:
+    """A recorder clock offset, expressed as a position in the stored audio.
+
+    Event offsets are wall clock since the session started. A privacy pause
+    keeps that clock running while producing no audio, so after one pause of
+    five seconds every later event sits five seconds further along the clock
+    than it does in the recording.
+
+    Reading those offsets as audio positions put the start of the next
+    patient inside the previous patient's segment -- five seconds of one
+    consultation attached to another's note. This is the correction.
+    """
+    shift = 0
+    for gap in gaps:
+        start = gap.get("start_ms")
+        end = gap.get("end_ms")
+        if start is None or start >= offset_ms:
+            break
+        if end is None:
+            # An unterminated pause: everything after it is inside the gap.
+            return max(0, start - shift)
+        if end <= offset_ms:
+            shift += max(0, end - start)
+        else:
+            # The offset falls inside the pause; the audio stopped at its start.
+            return max(0, start - shift)
+    return max(0, offset_ms - shift)
+
+
 def patient_segments(session_id: str) -> list[dict[str, Any]]:
     """Logical patient segments derived from patient_boundary events.
 
@@ -120,11 +206,17 @@ def patient_segments(session_id: str) -> list[dict[str, Any]]:
     if session is None:
         return []
     end = _session_duration_ms(session_id)
-    raw = {
+    gaps = privacy_gaps(session_id)
+    edges = chunk_edges(session_id)
+    # In clock order, so an earlier boundary claims its chunk start first and
+    # a later one cannot be snapped on top of it.
+    raw: set[int] = set()
+    for offset in sorted(
         int(e["offset_ms"])
         for e in events_for(session_id)
         if e["event"] == "patient_boundary" and e.get("offset_ms") is not None
-    }
+    ):
+        raw.add(_snap_to_chunk(to_audio_ms(offset, gaps), edges, raw))
     # A boundary at or past the end of the audio (a recorder with a clock or
     # offset bug) would otherwise produce a segment with a negative length.
     # Segments are what keep two patients' audio apart, so anything that cannot
@@ -132,10 +224,10 @@ def patient_segments(session_id: str) -> list[dict[str, Any]]:
     boundaries = sorted(
         b for b in raw if b > 0 and (end is None or b < end)
     )
-    edges = [0, *boundaries]
+    marks = [0, *boundaries]
     segments: list[dict[str, Any]] = []
-    for index, start in enumerate(edges):
-        stop = edges[index + 1] if index + 1 < len(edges) else end
+    for index, start in enumerate(marks):
+        stop = marks[index + 1] if index + 1 < len(marks) else end
         segments.append(
             {
                 "index": index + 1,

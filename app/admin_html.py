@@ -129,6 +129,17 @@ async function act(url, body, method){
 """
 
 
+def _t(value: Any, *, with_date: bool = True) -> str:
+    """Every timestamp on screen goes through here.
+
+    Stored in UTC, shown on the practice's own clock: a consultation at 21:45
+    in Leusden was appearing as 19:45.
+    """
+    from .util import local_time
+
+    return local_time(value, with_date=with_date)
+
+
 def _e(value: Any) -> str:
     return html.escape("" if value is None else str(value), quote=True)
 
@@ -208,7 +219,7 @@ def _sessions_table(rows: list[dict[str, Any]]) -> str:
 <td>{_state_chip(r['state'], r['ingest_confirmed'])}</td>
 <td class="right nowrap">{r['received_chunks']} / {r['expected_chunks']}</td>
 <td class="nowrap muted">{_e(r['client_status'] or '—')}</td>
-<td class="nowrap muted">{_e((r['created_at'] or '')[:19].replace('T',' '))}</td></tr>"""
+<td class="nowrap muted">{_e(_t(r['created_at']))}</td></tr>"""
         for r in rows
     )
     return f"""<div class="scroll"><table><thead><tr><th>Session</th><th>Device</th>
@@ -263,7 +274,7 @@ def render_dashboard(d: dict[str, Any], who: str) -> str:
 {_e(x['device_id'])}</a></td>
 <td>{'<span class="chip ok">enabled</span>' if x['enabled'] else '<span class="chip bad">disabled</span>'}</td>
 <td>{_auth_chip(x)}</td>
-<td class="muted nowrap">{_e((x['last_seen_at'] or '—')[:19].replace('T',' '))}</td>
+<td class="muted nowrap">{_e(_t(x['last_seen_at']) or '—')}</td>
 <td class="right">{_e(x['battery_percent'] if x['battery_percent'] is not None else '—')}</td>
 <td class="right">{_e(x['queue_count'] if x['queue_count'] is not None else '—')}</td>
 <td class="muted">{_e(x['software_version'] or '—')}</td></tr>"""
@@ -295,7 +306,7 @@ running since {_e((d['installed_at'] or '')[:10])}</p>
 <h2>Server key</h2><div class="panel">
 <dl class="kv"><dt>Key ID</dt><dd class="mono">{_e(key.get('key_id','—'))}</dd>
 <dt>Algorithm</dt><dd>{_e(key.get('algorithm','—'))}</dd>
-<dt>Created</dt><dd>{_e((key.get('created_at') or '')[:19].replace('T',' '))}</dd>
+<dt>Created</dt><dd>{_e(_t(key.get('created_at')))}</dd>
 <dt>Plaintext audio at rest</dt>
 <dd>{'yes (VS_STORE_PLAINTEXT is on)' if d['store_plaintext'] else 'no — ciphertext only'}</dd>
 <dt>Data directory</dt>
@@ -386,7 +397,7 @@ def render_session_detail(d: dict[str, Any], who: str) -> str:
 <td class="right nowrap">{_e(human_bytes(c['plaintext_size']))}</td>
 <td class="right nowrap">{_e(_ms(c['flac'].get('duration_ms')))}</td>
 <td class="mono muted nowrap">{_e((c['ciphertext_sha256'] or '')[:12])}…</td>
-<td class="muted nowrap">{_e((c['received_at'] or '')[11:19])}</td>
+<td class="muted nowrap">{_e(_t(c['received_at'], with_date=False))}</td>
 <td class="nowrap"><a href="/admin/api/sessions/{_e(sid)}/chunks/{c['sequence']}/download?form=encrypted">enc</a>
  · <a href="/admin/api/sessions/{_e(sid)}/chunks/{c['sequence']}/download?form=decrypted">flac</a></td>
 </tr>"""
@@ -441,13 +452,13 @@ missing data.</p><div class="scroll"><table><thead><tr><th>From</th><th>To</th>
 {''.join(banners)}
 <div class="grid g2">
 <div class="panel"><h3 style="margin-top:0">Session</h3><dl class="kv">
-<dt>Started</dt><dd class="mono">{_e(raw.get('started_at') or '—')}</dd>
-<dt>Completed</dt><dd class="mono">{_e(raw.get('completed_at') or '—')}</dd>
+<dt>Started</dt><dd class="mono">{_e(_t(raw.get('started_at')) or '—')}</dd>
+<dt>Completed</dt><dd class="mono">{_e(_t(raw.get('completed_at')) or '—')}</dd>
 <dt>Client status</dt><dd>{_e(s['client_status'] or '—')}</dd>
 <dt>Complete requested</dt><dd>{'yes' if raw.get('complete_requested') else 'no'}</dd>
 <dt>Declared chunk_count</dt><dd>{_e(raw.get('complete_chunk_count'))}</dd>
 <dt>Chunks</dt><dd>{s['received_chunks']} received / {s['expected_chunks']} manifested</dd>
-<dt>Ingested at</dt><dd class="mono">{_e(raw.get('ingested_at') or '—')}</dd>
+<dt>Ingested at</dt><dd class="mono">{_e(_t(raw.get('ingested_at')) or '—')}</dd>
 <dt>Error</dt><dd>{_e(raw.get('error_message') or '—')}</dd>
 </dl></div>
 <div class="panel"><h3 style="margin-top:0">Audio &amp; encryption</h3><dl class="kv">
@@ -480,8 +491,10 @@ record that a purge happened is kept.</p></div>
 <div class="panel"><h3 style="margin-top:0">Events</h3>
 <ul class="plain timeline">{events}</ul></div>
 <div class="panel"><h3 style="margin-top:0">Patient segments</h3>
-<p class="muted" style="margin-top:0">Derived from <code>patient_boundary</code> events.
-Segments are never combined into one note.</p>
+<p class="muted" style="margin-top:0">Derived from <code>patient_boundary</code> events,
+converted from the recorder's clock to a position in the audio &mdash; a privacy pause stops
+the audio but not the clock &mdash; and snapped to the chunk the recorder started for that
+patient. Segments are never combined into one note.</p>
 <div class="scroll"><table><thead><tr><th class="right">#</th><th>From</th><th>To</th>
 <th>Duration</th></tr></thead><tbody>{segments}</tbody></table></div></div></div>
 {gaps_block}
@@ -543,7 +556,7 @@ def _audit_rows(rows: list[dict[str, Any]]) -> str:
         action = _e(r["action"]) + (
             f' <span class="chip">#{seq}</span>' if seq is not None else "")
         out.append(
-            f"""<tr><td class="mono muted nowrap">{_e((r['ts'] or '')[:19].replace('T',' '))}</td>
+            f"""<tr><td class="mono muted nowrap">{_e(_t(r['ts']))}</td>
 <td>{_e(r['category'])}</td><td class="mono">{action}</td><td>{chip}</td>
 <td class="mono muted" style="max-width:520px;word-break:break-word">{_e(detail)}</td></tr>"""
         )
@@ -558,7 +571,7 @@ def render_devices(d: dict[str, Any], who: str) -> str:
 <td>{_auth_chip(x)}</td>
 <td class="right">{x['sessions']}</td>
 <td class="right">{x['sessions_confirmed']}</td>
-<td class="muted nowrap">{_e((x['last_seen_at'] or '—')[:19].replace('T',' '))}</td>
+<td class="muted nowrap">{_e(_t(x['last_seen_at']) or '—')}</td>
 <td class="muted">{_e(x['last_auth_method'] or '—')}</td></tr>"""
         for x in d["devices"]
     ) or '<tr><td colspan="7" class="muted">No devices yet.</td></tr>'
@@ -638,10 +651,10 @@ def render_device_detail(d: dict[str, Any], who: str) -> str:
 <dt>Token</dt><dd>{_e(x['token_hint'] or 'none issued')}</dd>
 <dt>Pinned certificate</dt><dd class="mono">{_e(x['cert_fingerprint'] or 'none')}</dd>
 <dt>Certificate subject</dt><dd class="mono">{_e(x['cert_subject'] or '—')}</dd>
-<dt>Last seen</dt><dd class="mono">{_e(x['last_seen_at'] or '—')}</dd>
+<dt>Last seen</dt><dd class="mono">{_e(_t(x['last_seen_at']) or '—')}</dd>
 <dt>Last method</dt><dd>{_e(x['last_auth_method'] or '—')}</dd>
 <dt>Last IP</dt><dd class="mono">{_e(x['last_source_ip'] or '—')}</dd>
-<dt>Enrolment window</dt><dd class="mono">{_e(d['enrolment_expires_at'] or 'closed')}</dd>
+<dt>Enrolment window</dt><dd class="mono">{_e(_t(d['enrolment_expires_at']) or 'closed')}</dd>
 </dl></div>
 <div class="panel"><h3 style="margin-top:0">Reported by the device</h3><dl class="kv">
 <dt>Software</dt><dd>{_e(x['software_version'] or '—')}</dd>
@@ -704,7 +717,7 @@ def render_keys(keys: list[dict[str, Any]], who: str) -> str:
 <div><strong class="mono">{_e(k['key_id'])}</strong>
 {'<span class="chip ok">active</span>' if k['active'] else '<span class="chip">retired</span>'}
 <div class="muted">{_e(k['algorithm'])} · created
-{_e((k['created_at'] or '')[:19].replace('T',' '))}
+{_e(_t(k['created_at']))}
 {('· retired ' + _e((k['retired_at'] or '')[:19].replace('T',' '))) if k['retired_at'] else ''}
 </div></div>
 <div class="narrow"><button onclick='copy({_e(json.dumps(k["public_pem"]))})'>Copy public key</button>
@@ -781,7 +794,7 @@ def _audit_full_rows(rows: list[dict[str, Any]]) -> str:
         did_cell = (f'<a href="/admin/devices/{_e(did)}">{_e(did)}</a>'
                     if did else '<span class="muted">—</span>')
         out.append(
-            f"""<tr><td class="mono muted nowrap">{_e((r['ts'] or '')[:19].replace('T',' '))}</td>
+            f"""<tr><td class="mono muted nowrap">{_e(_t(r['ts']))}</td>
 <td>{_e(r['category'])}</td><td class="mono">{_e(r['action'])}</td><td>{chip}</td>
 <td class="nowrap">{did_cell}</td><td class="nowrap">{sid_cell}</td>
 <td class="mono muted" style="max-width:420px;word-break:break-word">{_e(detail)}</td></tr>"""

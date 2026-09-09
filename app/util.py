@@ -124,3 +124,32 @@ def iso_from_epoch(seconds: float) -> str:
 def epoch_from_iso(value: str | None) -> float | None:
     parsed = parse_iso(value)
     return parsed.timestamp() if parsed else None
+
+
+# The pod stores every timestamp in UTC, which is right, and used to show them
+# in UTC too, which was not: a consultation at 21:45 in Leusden appeared as
+# 19:45. Display goes through here instead. TZ is set on the container
+# (Europe/Amsterdam); VS_DISPLAY_TZ overrides it, and an unknown zone falls
+# back to UTC rather than failing to render a page.
+def display_zone():
+    import os
+    from datetime import timezone
+
+    name = os.environ.get("VS_DISPLAY_TZ") or os.environ.get("TZ") or ""
+    if not name:
+        return timezone.utc
+    try:
+        from zoneinfo import ZoneInfo
+
+        return ZoneInfo(name)
+    except Exception:  # noqa: BLE001
+        return timezone.utc
+
+
+def local_time(value: str | None, *, with_date: bool = True) -> str:
+    """An ISO-8601 UTC timestamp as the practice's own wall clock."""
+    parsed = parse_iso(value)
+    if parsed is None:
+        return "" if value is None else str(value)
+    local = parsed.astimezone(display_zone())
+    return local.strftime("%Y-%m-%d %H:%M:%S" if with_date else "%H:%M:%S")

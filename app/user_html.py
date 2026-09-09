@@ -214,8 +214,15 @@ Nog geen opnames. Zodra je recorder iets instuurt verschijnt het hier.</div></di
 
 
 def _when(row: dict[str, Any]) -> str:
+    """On the practice's clock, not UTC.
+
+    Timestamps are stored in UTC, which is right; showing them in UTC is not.
+    A consultation at 21:45 in Leusden was appearing as 19:45.
+    """
+    from .util import local_time
+
     value = row.get("started_at") or row.get("created_at") or ""
-    return str(value).replace("T", " ")[:16].replace("Z", "")
+    return local_time(value)[:16]
 
 
 def render_recording(d: dict[str, Any], who: str) -> str:
