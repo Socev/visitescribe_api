@@ -1,0 +1,8 @@
+fastapi==0.115.6
+uvicorn[standard]==0.34.0
+pydantic==2.10.4
+cryptography==44.0.0
+soundfile==0.12.1
+# soundfile does not depend on numpy, but reading samples requires it.
+numpy==2.2.1
+python-multipart==0.0.20

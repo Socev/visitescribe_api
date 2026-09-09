@@ -1,0 +1,135 @@
+name: test and publish image
+
+on:
+  push:
+    branches: [main]
+    tags: ['v*']
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+env:
+  REGISTRY: ghcr.io
+  IMAGE_NAME: socev/visitescribe_api
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+          cache: pip
+      - name: Install libsndfile
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends libsndfile1
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements-dev.txt numpy
+      - name: Run the acceptance suite
+        run: pytest tests/ -q
+
+  build:
+    needs: test
+    if: github.event_name != 'pull_request'
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform: linux/amd64
+            runner: ubuntu-latest
+            suffix: amd64
+          # Native arm64 runner: QEMU emulation of a Python image with compiled
+          # dependencies is an order of magnitude slower and times out.
+          - platform: linux/arm64
+            runner: ubuntu-24.04-arm
+            suffix: arm64
+    runs-on: ${{ matrix.runner }}
+    permissions:
+      contents: read
+      packages: write
+    outputs:
+      digest-amd64: ${{ steps.export.outputs.digest-amd64 }}
+      digest-arm64: ${{ steps.export.outputs.digest-arm64 }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: docker/setup-buildx-action@v3
+
+      - uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build and push by digest
+        id: build
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          platforms: ${{ matrix.platform }}
+          labels: |
+            org.opencontainers.image.source=https://github.com/${{ github.repository }}
+            org.opencontainers.image.title=VisiteScribe Ingest API
+            org.opencontainers.image.description=Encrypted session mailbox for the VisiteScribe medical audio recorder
+            org.opencontainers.image.licenses=MIT
+          outputs: type=image,name=${{ env.REGISTRY }}/${{ env.IMAGE_NAME }},push-by-digest=true,name-canonical=true,push=true
+          cache-from: type=gha,scope=${{ matrix.suffix }}
+          cache-to: type=gha,mode=max,scope=${{ matrix.suffix }}
+
+      - name: Record digest
+        run: |
+          mkdir -p /tmp/digests
+          echo -n "${{ steps.build.outputs.digest }}" > "/tmp/digests/${{ matrix.suffix }}"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: digest-${{ matrix.suffix }}
+          path: /tmp/digests/*
+          retention-days: 1
+
+  manifest:
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: /tmp/digests
+          pattern: digest-*
+          merge-multiple: true
+
+      - uses: docker/setup-buildx-action@v3
+
+      - uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Extract metadata
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+          tags: |
+            type=raw,value=latest,enable={{is_default_branch}}
+            type=ref,event=branch
+            type=semver,pattern={{version}}
+            type=semver,pattern={{major}}.{{minor}}
+            type=sha,format=long
+
+      - name: Create the multi-arch manifest
+        working-directory: /tmp/digests
+        run: |
+          docker buildx imagetools create \
+            $(jq -cr '.tags | map("-t " + .) | join(" ")' <<< "$DOCKER_METADATA_OUTPUT_JSON") \
+            $(for f in *; do echo -n "${REGISTRY}/${IMAGE_NAME}@$(cat "$f") "; done)
+
+      - name: Show what was published
+        run: |
+          docker buildx imagetools inspect \
+            "${REGISTRY}/${IMAGE_NAME}:${{ steps.meta.outputs.version }}"
