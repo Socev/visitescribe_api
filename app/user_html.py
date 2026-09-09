@@ -37,8 +37,57 @@ border-radius:8px;padding:12px;font-size:13.5px;line-height:1.55}
 @media(max-width:900px){.two{grid-template-columns:1fr}}
 .pill{display:inline-block;padding:2px 9px;border-radius:999px;background:var(--chip);
 font-size:12px;color:var(--muted)}
+.headrow{display:flex;align-items:baseline;gap:10px;justify-content:space-between}
+.headrow h3{margin:18px 0 8px}
+button.copy{font-size:12px;padding:3px 10px;line-height:1.5}
+.live{display:inline-flex;align-items:center;gap:6px;color:var(--muted);font-size:12px}
+.live .dot{width:7px;height:7px;border-radius:50%;background:var(--ok);
+animation:pulse 2s ease-in-out infinite}
+@keyframes pulse{0%,100%{opacity:.35}50%{opacity:1}}
 """
 
+
+# The page reloads itself when the server says something changed, rather than
+# on a timer: a blind reload every ten seconds throws away your scroll position
+# and your place in a transcript for nothing. `/api/stand` returns a cheap
+# fingerprint; only a different one triggers the reload.
+LIVE_JS = """
+function copyBlock(button, id){
+  const el = document.getElementById(id);
+  if(!el) return;
+  const text = el.innerText;
+  const done = () => { const was = button.textContent;
+    button.textContent = 'gekopieerd'; setTimeout(()=>{button.textContent = was}, 1500); };
+  if(navigator.clipboard && window.isSecureContext){
+    navigator.clipboard.writeText(text).then(done, () => fallback(text, done));
+  } else { fallback(text, done); }
+}
+function fallback(text, done){
+  // clipboard API needs a secure context; this works everywhere else.
+  const ta = document.createElement('textarea');
+  ta.value = text; ta.setAttribute('readonly','');
+  ta.style.position = 'fixed'; ta.style.left = '-9999px';
+  document.body.appendChild(ta); ta.select();
+  try { document.execCommand('copy'); done(); } catch(e) { /* niets */ }
+  document.body.removeChild(ta);
+}
+function watch(url){
+  let known = null, failures = 0;
+  const tick = async () => {
+    try {
+      const r = await fetch(url, {headers: {'Accept': 'application/json'}});
+      if(!r.ok) throw new Error(r.status);
+      const stand = (await r.json()).stand;
+      failures = 0;
+      if(known === null){ known = stand; }
+      else if(stand !== known){ location.reload(); return; }
+    } catch(e) { failures += 1; }
+    // back off rather than hammer a pod that is having a bad time
+    setTimeout(tick, failures > 3 ? 60000 : 8000);
+  };
+  setTimeout(tick, 8000);
+}
+"""
 
 def _e(value: Any) -> str:
     return html.escape("" if value is None else str(value), quote=True)
@@ -59,10 +108,11 @@ def layout(title: str, body: str, active: str = "", who: str = "",
     who_html = f'<span class="who">{_e(who)}</span>' if who else ""
     return f"""<!doctype html><html lang="nl"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
-<title>{_e(title)} · VisiteScribe</title><style>{CSS}{EXTRA_CSS}</style></head><body>
+<title>{_e(title)} · VisiteScribe</title><style>{CSS}{EXTRA_CSS}</style>
+<script>{JS}{LIVE_JS}</script></head><body>
 <header class="top"><div class="brand">VisiteScribe<span>voor de praktijk</span></div>
 <nav>{nav}</nav><div class="spacer"></div>{who_html}{signout}</header>
-<main>{body}</main><div id="toast"></div><script>{JS}</script></body></html>"""
+<main>{body}</main><div id="toast"></div></body></html>"""
 
 
 # ---------------------------------------------------------------------------
@@ -157,8 +207,10 @@ Nog geen opnames. Zodra je recorder iets instuurt verschijnt het hier.</div></di
         cards += "</div>"
     return layout("Mijn opnames", f"""
 <div class="hero"><div><h1>Mijn opnames</h1>
-<p class="sub">Alles wat jouw recorder heeft ingestuurd.</p></div></div>
-{cards}""", active="opnames", who=who)
+<p class="sub">Alles wat jouw recorder heeft ingestuurd.
+<span class="live"><span class="dot"></span>ververst zichzelf</span></p></div></div>
+{cards}
+<script>watch('/api/stand');</script>""", active="opnames", who=who)
 
 
 def _when(row: dict[str, Any]) -> str:
@@ -173,16 +225,22 @@ def render_recording(d: dict[str, Any], who: str) -> str:
 
     pairs = []
     for item in d.get("results") or []:
+        # segment_index is already 1-based (sessions.patient_segments starts
+        # at 1), so adding one labelled every patient with the next patient's
+        # number -- the first consultation of a round showed up as "Patiënt 2".
         title = ("Hele opname" if item.get("segment_index") is None
-                 else f"Patiënt {int(item['segment_index']) + 1}")
+                 else f"Patiënt {int(item['segment_index'])}")
         transcript = item.get("transcript") or ""
         note = item.get("note") or ""
+        key = "full" if item.get("segment_index") is None else str(item["segment_index"])
         pairs.append(f"""<div class="panel"><h2>{_e(title)}</h2>
 <div class="two">
-  <div><h3>Verslag</h3>
-    <div class="note">{_e(note) or '<i>nog geen verslag</i>'}</div></div>
-  <div><h3>Transcript</h3>
-    <div class="note">{_e(transcript) or '<i>nog geen transcript</i>'}</div></div>
+  <div><div class="headrow"><h3>Verslag</h3>
+      {'<button class="copy" onclick="copyBlock(this, %s)">kopieer</button>' % repr("note-" + key) if note else ''}</div>
+    <div class="note" id="note-{_e(key)}">{_e(note) or '<i>nog geen verslag</i>'}</div></div>
+  <div><div class="headrow"><h3>Transcript</h3>
+      {'<button class="copy" onclick="copyBlock(this, %s)">kopieer</button>' % repr("tr-" + key) if transcript else ''}</div>
+    <div class="note" id="tr-{_e(key)}">{_e(transcript) or '<i>nog geen transcript</i>'}</div></div>
 </div></div>""")
     results = "".join(pairs) or """<div class="panel"><div class="empty">
 Er is nog niets verwerkt voor deze opname.</div></div>"""
@@ -197,12 +255,16 @@ Er is nog niets verwerkt voor deze opname.</div></div>"""
       style="display:flex;gap:10px;flex-wrap:wrap;align-items:center">
 <select name="route">{options}</select><button>Verwerken</button></form></div>"""
 
+    live = ('<span class="live"><span class="dot"></span>ververst zichzelf</span>'
+            if d.get("busy") else "")
     return layout("Opname", f"""
 <div class="hero"><div><h1>{_e(_when(rec))}</h1>
 <p class="sub">{_e(kind)} · {_e(_duration(rec.get('duration_seconds')))}
- · {_state_pill(rec['state'])}</p></div></div>
+ · {_state_pill(rec['state'])} {live}</p></div></div>
 {action}{results}
-<p><a href="/">← alle opnames</a></p>""", active="opnames", who=who)
+<p><a href="/">← alle opnames</a></p>
+<script>watch('/api/stand?opname={_e(rec['session_id'])}');</script>""",
+                  active="opnames", who=who)
 
 
 # ---------------------------------------------------------------------------

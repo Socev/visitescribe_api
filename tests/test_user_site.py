@@ -492,3 +492,152 @@ def test_the_global_kill_switch_announces_itself(site, fake_ourmind, server,
     with override_settings(auto_process=False):
         page = site.get("/instellingen").text
     assert "staat op deze server uitgeschakeld" in page
+
+
+# ---------------------------------------------------------------------------
+# what David hit on a real patient round
+# ---------------------------------------------------------------------------
+
+def test_patients_are_numbered_as_the_recorder_numbered_them(site, fake_ourmind,
+                                                             server):
+    """The first consultation of a round was labelled "Patiënt 2".
+
+    patient_segments already numbers from 1; the page added one on top, so
+    every note carried the NEXT patient's number. In a consulting room that is
+    not a cosmetic bug.
+    """
+    from app import processing, users
+
+    user = users.create("dokter@praktijk.nl")
+    server.register_device("visitescribe-001")
+    users.bind_device("visitescribe-001", user["user_id"])
+    _sign_in(site)
+
+    rec = Recorder(server, device_id="visitescribe-001", mode="multi_patient")
+    for i in range(4):
+        rec.add_chunk(seconds=1.0, seed=i)
+    rec.create(); rec.upload_all()
+    rec.send_events([{"event": "patient_boundary", "offset_ms": 1000},
+                     {"event": "patient_boundary", "offset_ms": 2000}])
+    rec.complete()
+
+    processing.enqueue(rec.session_id, "ourmind", actor="test")
+    for _ in range(8):
+        processing.run_once()
+
+    page = site.get(f"/opname/{rec.session_id}").text
+    assert "Patiënt 1" in page
+    assert "Patiënt 2" in page
+    assert "Patiënt 3" in page
+    assert "Patiënt 4" not in page          # three segments, not four
+
+    # the first block on the page really is patient 1
+    assert page.index("Patiënt 1") < page.index("Patiënt 2") < page.index("Patiënt 3")
+
+
+def test_a_job_left_running_by_a_restart_is_picked_up_again(server, fake_ourmind,
+                                                           monkeypatch):
+    """A pod restart mid-job stranded the recording on "running" for ever.
+
+    Nothing ever touched that row again: no error, no retry, no explanation.
+    This is the case David hit by upgrading while a note was being generated.
+    """
+    from app import processing
+
+    monkeypatch.setenv("VS_OURMIND_TOKEN", "test-token")
+    server.register_device("visitescribe-001")
+    rec = Recorder(server)
+    rec.add_chunk(seconds=1.0)
+    rec.create(); rec.upload_all(); rec.complete()
+    processing.enqueue(rec.session_id, "ourmind", actor="test")
+
+    # claim it and then "die"
+    server.db.execute("UPDATE processing_jobs SET state = 'running' "
+                      "WHERE session_id = ?", (rec.session_id,))
+    assert processing.run_once() is False          # nothing is claimable
+
+    assert processing.requeue_orphans(reason="test") == 1
+    job = processing.jobs_for(rec.session_id)[0]
+    assert job["state"] == "queued"
+    assert "Onderbroken" in (job["error"] or "")
+    assert processing.run_once() is True           # and it runs
+
+
+def test_a_job_running_far_too_long_is_reclaimed(server, fake_ourmind,
+                                                 monkeypatch):
+    """The other net: the thread died but the process lived."""
+    from app import processing
+
+    monkeypatch.setenv("VS_OURMIND_TOKEN", "test-token")
+    server.register_device("visitescribe-001")
+    rec = Recorder(server)
+    rec.add_chunk(seconds=1.0)
+    rec.create(); rec.upload_all(); rec.complete()
+    processing.enqueue(rec.session_id, "ourmind", actor="test")
+
+    server.db.execute(
+        "UPDATE processing_jobs SET state = 'running', started_at = ? "
+        "WHERE session_id = ?", ("2020-01-01T00:00:00Z", rec.session_id))
+
+    assert processing.reclaim_stale(max_age_seconds=1800) == 1
+    job = processing.jobs_for(rec.session_id)[0]
+    assert job["state"] == "queued"
+    assert "langer dan 30 minuten" in (job["error"] or "")
+
+    # a job that has only just started is left alone
+    server.db.execute("UPDATE processing_jobs SET state = 'running', started_at = ? "
+                      "WHERE session_id = ?", (__import__("app.util", fromlist=["x"])
+                                               .now_iso(), rec.session_id))
+    assert processing.reclaim_stale(max_age_seconds=1800) == 0
+
+
+def test_the_page_offers_to_copy_and_watches_for_changes(site, fake_ourmind,
+                                                         server):
+    from app import processing, users
+
+    user = users.create("dokter@praktijk.nl")
+    server.register_device("visitescribe-001")
+    users.bind_device("visitescribe-001", user["user_id"])
+    _sign_in(site)
+
+    rec = Recorder(server, device_id="visitescribe-001")
+    rec.add_chunk(seconds=1.0)
+    rec.create(); rec.upload_all(); rec.complete()
+    processing.enqueue(rec.session_id, "ourmind", actor="test")
+    processing.run_once(); processing.run_once()
+
+    page = site.get(f"/opname/{rec.session_id}").text
+    assert page.count("kopieer") >= 2          # note and transcript
+    assert "watch('/api/stand?opname=" in page
+    # The helpers must be defined BEFORE the inline call that uses them. They
+    # were not, and the browser said "watch is not defined" while every test
+    # still passed -- HTML order is not something an assertion on content sees.
+    assert page.index("function watch(") < page.index("watch('/api/stand")
+    assert page.index("function copyBlock(") < page.index('onclick="copyBlock(')
+
+    first = site.get("/api/stand").json()["stand"]
+    assert first == site.get("/api/stand").json()["stand"]      # stable
+
+    detail = site.get(f"/api/stand?opname={rec.session_id}").json()["stand"]
+    server.db.execute("UPDATE processing_jobs SET updated_at = ? "
+                      "WHERE session_id = ?", ("2030-01-01T00:00:00Z", rec.session_id))
+    assert site.get(f"/api/stand?opname={rec.session_id}").json()["stand"] != detail
+
+
+def test_the_status_endpoint_is_scoped_to_the_signed_in_user(site, fake_ourmind,
+                                                             server):
+    from app import users
+
+    mine = users.create("dokter@praktijk.nl")
+    theirs = users.create("collega@praktijk.nl")
+    server.register_device("visitescribe-001")
+    server.register_device("visitescribe-002")
+    users.bind_device("visitescribe-001", mine["user_id"])
+    users.bind_device("visitescribe-002", theirs["user_id"])
+    _sign_in(site)
+
+    other = Recorder(server, device_id="visitescribe-002")
+    other.add_chunk(seconds=1.0)
+    other.create(); other.upload_all(); other.complete()
+
+    assert site.get(f"/api/stand?opname={other.session_id}").status_code == 404

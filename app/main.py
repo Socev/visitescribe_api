@@ -103,13 +103,32 @@ async def _worker_loop() -> None:
         log.info("processing worker disabled (VS_PROCESSING_ENABLED)")
         return
     log.info("processing worker started")
+    # Anything still marked `running` cannot be running: this is the only
+    # worker and it is starting now. A pod restart mid-job used to strand the
+    # recording on "running" for ever, with no error to explain it.
+    try:
+        orphans = await asyncio.to_thread(processing.requeue_orphans)
+        if orphans:
+            log.warning("requeued %d job(s) interrupted by a restart", orphans)
+    except Exception:  # noqa: BLE001
+        log.exception("could not requeue orphaned jobs")
+
     idle = settings.processing_poll_seconds
+    since_sweep = 0.0
     while True:
         try:
             did_work = await asyncio.to_thread(processing.run_once)
         except Exception:  # noqa: BLE001 - the loop must outlive one bad job
             log.exception("processing worker error")
             did_work = False
+        # ...and a job whose thread died without taking the process with it.
+        since_sweep += 0 if did_work else idle
+        if since_sweep >= 300:
+            since_sweep = 0.0
+            try:
+                await asyncio.to_thread(processing.reclaim_stale)
+            except Exception:  # noqa: BLE001
+                log.exception("stale job sweep failed")
         await asyncio.sleep(0 if did_work else idle)
 
 

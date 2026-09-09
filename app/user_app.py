@@ -15,7 +15,7 @@ from contextlib import asynccontextmanager
 from typing import Any
 
 from fastapi import FastAPI, Form, Request, Response
-from fastapi.responses import HTMLResponse, RedirectResponse
+from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse
 
 from . import audit, db, processing, routing, sessions, userauth, users
 from .bootstrap import initialise
@@ -231,6 +231,34 @@ def create_user_app() -> FastAPI:
         audit.log("user_login", "ourmind_disconnected", "success",
                   identity=user["email"], detail={"user_id": user["user_id"]})
         return RedirectResponse("/instellingen", status_code=303)
+
+    @app.get("/api/stand")
+    async def stand(request: Request, opname: str = "") -> Response:
+        """A cheap fingerprint of what this user can see.
+
+        The pages poll this and reload only when it changes, so a recording
+        that is still being processed updates by itself without throwing away
+        your scroll position every few seconds.
+        """
+        user = userauth.require_user(request)
+        if opname:
+            _recording_of(user["user_id"], opname)      # authorisation
+            row = db.query_one(
+                "SELECT COUNT(*) AS n, MAX(updated_at) AS u FROM processing_jobs "
+                "WHERE session_id = ?", (opname,))
+            res = db.query_one(
+                "SELECT (SELECT COUNT(*) FROM transcripts WHERE session_id = ?) "
+                "+ (SELECT COUNT(*) FROM notes WHERE session_id = ?) AS n", (opname, opname))
+            state = db.query_one("SELECT state FROM sessions WHERE session_id = ?",
+                                 (opname,))
+            mark = f"{row['n']}:{row['u']}:{res['n']}:{state['state']}"
+        else:
+            row = db.query_one(
+                "SELECT COUNT(*) AS n, MAX(s.updated_at) AS u FROM sessions s "
+                "JOIN devices d ON d.device_id = s.device_id WHERE d.user_id = ?",
+                (user["user_id"],))
+            mark = f"{row['n']}:{row['u']}"
+        return JSONResponse({"stand": mark})
 
     @app.get("/healthz")
     async def healthz() -> dict:

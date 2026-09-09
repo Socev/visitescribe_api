@@ -959,6 +959,24 @@ async function startProcessing(){{
   toast('In de wachtrij gezet','ok'); setTimeout(()=>location.reload(), 900);
 }}
 document.addEventListener('DOMContentLoaded', syncTemplateField);
+// The queue moves on its own, so the page should too -- but only reload when
+// the server says something actually changed, or you lose your place in the
+// chunk table every few seconds for nothing.
+(function(){{
+  let known = null, failures = 0;
+  const tick = async () => {{
+    try {{
+      const r = await fetch('/admin/api/sessions/'+SID+'/stand');
+      if(!r.ok) throw new Error(r.status);
+      const stand = (await r.json()).stand;
+      failures = 0;
+      if(known === null){{ known = stand; }}
+      else if(stand !== known){{ location.reload(); return; }}
+    }} catch(e){{ failures += 1; }}
+    setTimeout(tick, failures > 3 ? 60000 : 8000);
+  }};
+  setTimeout(tick, 8000);
+}})();
 async function cancelProcessing(){{
   await act('/admin/api/sessions/'+SID+'/processing/cancel', {{}});
   toast('Geannuleerd','ok'); setTimeout(()=>location.reload(), 700);

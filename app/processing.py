@@ -22,6 +22,8 @@ from . import audit, db, pricing, routing, sessions, users
 from .config import settings
 from .errors import ApiError
 from .providers import ProviderError, get as get_provider
+from datetime import timedelta
+
 from .util import now, now_iso, parse_iso
 
 log = logging.getLogger("visitescribe.processing")
@@ -127,6 +129,62 @@ def cancel(session_id: str, *, actor: str = "admin") -> int:
 # ---------------------------------------------------------------------------
 # running
 # ---------------------------------------------------------------------------
+
+# A job is marked `running` and then nothing else touches that row until it
+# finishes. If the process goes away in between -- a pod restart, an upgrade,
+# a kill -- the row stays `running` for ever and the recording is stranded
+# with no error to explain it. That is what "blijft hangen op running" was.
+#
+# Two nets. On startup anything still `running` is orphaned BY DEFINITION,
+# because there is exactly one worker and it just started. And while running,
+# a periodic sweep catches a job whose thread died without the process. The
+# lease has to be longer than the slowest legitimate job: OurMind polls for a
+# report for up to 15 minutes.
+STALE_RUNNING_SECONDS = 1800
+
+
+def requeue_orphans(*, reason: str = "worker restarted") -> int:
+    """Put every job that was running back in the queue."""
+    rows = db.query("SELECT id, session_id, stage FROM processing_jobs "
+                    "WHERE state = 'running'")
+    if not rows:
+        return 0
+    db.execute(
+        "UPDATE processing_jobs SET state = 'queued', next_attempt_at = NULL, "
+        "error = ?, updated_at = ? WHERE state = 'running'",
+        (f"Onderbroken ({reason}); opnieuw in de wachtrij gezet.", now_iso()),
+    )
+    for row in rows:
+        log.warning("requeued orphaned job %s (%s) for %s",
+                    row["id"], row["stage"], row["session_id"])
+        audit.log("processing", "orphan_requeued", "retry",
+                  session_id=row["session_id"], identity="worker",
+                  detail={"job": row["id"], "stage": row["stage"], "reason": reason})
+    return len(rows)
+
+
+def reclaim_stale(max_age_seconds: int = STALE_RUNNING_SECONDS) -> int:
+    """Requeue a job that has been `running` longer than any job legitimately can."""
+    cutoff = now() - timedelta(seconds=max_age_seconds)
+    cutoff_iso = cutoff.isoformat().replace("+00:00", "Z")
+    rows = db.query(
+        "SELECT id, session_id, stage FROM processing_jobs WHERE state = 'running' "
+        "AND (started_at IS NULL OR started_at < ?)", (cutoff_iso,))
+    if not rows:
+        return 0
+    db.execute(
+        "UPDATE processing_jobs SET state = 'queued', next_attempt_at = NULL, "
+        "error = ?, updated_at = ? WHERE state = 'running' "
+        "AND (started_at IS NULL OR started_at < ?)",
+        (f"Liep langer dan {max_age_seconds // 60} minuten zonder resultaat; "
+         "opnieuw in de wachtrij gezet.", now_iso(), cutoff_iso),
+    )
+    for row in rows:
+        audit.log("processing", "stale_requeued", "retry",
+                  session_id=row["session_id"], identity="worker",
+                  detail={"job": row["id"], "stage": row["stage"]})
+    return len(rows)
+
 
 def _claim() -> dict[str, Any] | None:
     """Take the oldest job that is due. One writer, so a plain update suffices."""
