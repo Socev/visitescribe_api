@@ -168,24 +168,26 @@ def create_admin_app() -> FastAPI:
 
     @app.post("/admin/api/users", include_in_schema=False)
     async def create_user(request: Request):  # noqa: ANN202
-        require_admin(request)
-        body = await request.json()
+        who = guard(request)
+        body = await _body(request)
         user = users.create(str(body.get("email") or ""),
-                            display_name=str(body.get("display_name") or ""))
+                            display_name=str(body.get("display_name") or ""),
+                            actor=who)
         return JSONResponse({"user": user}, status_code=201)
 
     @app.post("/admin/api/users/{user_id}/enabled", include_in_schema=False)
     async def set_user_enabled(user_id: str, request: Request):  # noqa: ANN202
-        require_admin(request)
-        body = await request.json()
-        users.set_disabled(user_id, not bool(body.get("enabled", True)))
+        who = guard(request)
+        body = await _body(request)
+        users.set_disabled(user_id, not bool(body.get("enabled", True)), actor=who)
         return JSONResponse({"ok": True})
 
     @app.post("/admin/api/devices/{device_id}/owner", include_in_schema=False)
     async def bind_device(device_id: str, request: Request):  # noqa: ANN202
-        require_admin(request)
-        body = await request.json()
-        users.bind_device(device_id, str(body.get("user_id") or "") or None)
+        who = guard(request)
+        body = await _body(request)
+        users.bind_device(device_id, str(body.get("user_id") or "") or None,
+                          actor=who)
         return JSONResponse({"ok": True})
 
     @app.get("/admin/devices/{device_id}", response_class=HTMLResponse,

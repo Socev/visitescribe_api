@@ -157,7 +157,7 @@ def layout(title: str, body: str, active: str = "", who: str = "") -> str:
 <title>{_e(title)} · VisiteScribe</title><style>{CSS}</style></head><body>
 <header class="top"><div class="brand">VisiteScribe<span>ingest admin</span></div>
 <nav>{nav}</nav><div class="spacer"></div>{who_html}
-<button onclick="api('/admin/api/logout',{{method:'POST'}}).then(()=>location='/admin/login')"
+<button onclick="act('/admin/api/logout',{{}}).then(()=>location='/admin/login')"
  style="margin:8px 0">Sign out</button></header>
 <main>{body}</main><div id="toast"></div><script>{JS}</script></body></html>"""
 
@@ -1077,14 +1077,14 @@ def render_users(d: dict[str, Any], who: str) -> str:
 <div style="display:flex;gap:12px;align-items:flex-start;flex-wrap:wrap">
 <div style="flex:1;min-width:220px">
   <div style="font-weight:600">{_e(u['display_name'] or u['email'])}</div>
-  <div class="muted">{_e(u['email'])}{' · ' + _e(u['org_name']) if u['org_name'] else ''}</div>
+  <div class="muted">{_e(u['email']) if u['display_name'] else ''}{' · ' + _e(u['org_name']) if u['org_name'] else ''}</div>
   <div style="margin-top:8px">{chip}
     {'<span class="chip bad">uitgeschakeld</span>' if u['disabled'] else ''}</div>
 </div>
 <div style="flex:1;min-width:220px"><h3>Recorders</h3>{devices}</div>
-<div><button onclick="api('/admin/api/users/{_e(u['user_id'])}/enabled',
-  {{method:'POST',body:JSON.stringify({{enabled:{'false' if not u['disabled'] else 'true'}}})}})
-  .then(()=>location.reload())">{'Inschakelen' if u['disabled'] else 'Uitschakelen'}</button></div>
+<div><button onclick="act('/admin/api/users/{_e(u['user_id'])}/enabled',
+  {{enabled:{'false' if not u['disabled'] else 'true'}}}).then(()=>location.reload())"
+  >{'Inschakelen' if u['disabled'] else 'Uitschakelen'}</button></div>
 </div></div>""")
 
     unbound = "".join(f"""<div class="typerow" style="display:flex;gap:10px;
@@ -1108,16 +1108,20 @@ OurMind-account. Koppel daarna een of meer recorders.</p>
 <input id="newEmail" type="email" placeholder="dokter@praktijk.nl"></div>
 <div style="flex:1;min-width:180px"><label>Naam (optioneel)</label>
 <input id="newName" placeholder="wordt anders overgenomen van OurMind"></div>
-<button onclick="api('/admin/api/users',{{method:'POST',body:JSON.stringify(
-  {{email:document.getElementById('newEmail').value,
-    display_name:document.getElementById('newName').value}})}})
-  .then(()=>location.reload())">Toevoegen</button></div></div>
+<button onclick="addUser()">Toevoegen</button></div></div>
 {unbound_panel}
 {''.join(rows) or '<div class="panel"><div class="muted">Nog geen gebruikers.</div></div>'}
 <script>
+function addUser(){{
+  const email = document.getElementById('newEmail').value.trim();
+  if(!email){{ toast('Vul een e-mailadres in','bad'); return; }}
+  act('/admin/api/users', {{email: email,
+      display_name: document.getElementById('newName').value}})
+    .then(()=>location.reload());
+}}
 function bindDevice(deviceId, userId){{
-  api('/admin/api/devices/'+encodeURIComponent(deviceId)+'/owner',
-      {{method:'POST',body:JSON.stringify({{user_id:userId}})}}).then(()=>location.reload());
+  act('/admin/api/devices/'+encodeURIComponent(deviceId)+'/owner',
+      {{user_id:userId}}).then(()=>location.reload());
 }}
 </script>"""
     return layout("Users", body, "users", who)

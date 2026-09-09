@@ -347,3 +347,76 @@ def test_a_shared_template_is_refused_with_an_explanation(site, fake_ourmind, se
         client.make_note(transcript, context={"template_id": "5",
                                               "template_type": "shared_template"})
     assert "kloon" in str(caught.value).lower()
+
+
+# ---------------------------------------------------------------------------
+# the admin side of the same feature
+#
+# These exist because they did not, and the "Toevoegen" button shipped calling
+# a guard that was never defined. It failed silently in the browser: the
+# handler had no .catch(), so a rejected promise showed nothing at all. Both
+# halves are now covered -- the endpoints here, and every button routed
+# through act(), which reports the error instead of swallowing it.
+# ---------------------------------------------------------------------------
+
+def test_admin_can_add_a_user_and_bind_a_device(server):
+    from app import users
+
+    server.register_device("visitescribe-001")
+    server.admin_login()
+
+    created = server.admin.post("/admin/api/users",
+                                json={"email": "D.Schaap@Gmail.com "})
+    assert created.status_code == 201, created.text
+    user_id = created.json()["user"]["user_id"]
+    assert created.json()["user"]["email"] == "d.schaap@gmail.com"
+
+    bound = server.admin.post("/admin/api/devices/visitescribe-001/owner",
+                              json={"user_id": user_id})
+    assert bound.status_code == 200, bound.text
+    assert [d["device_id"] for d in users.devices_of(user_id)] == ["visitescribe-001"]
+    assert users.unbound_devices() == []
+
+    page = server.admin.get("/admin/users").text
+    assert "d.schaap@gmail.com" in page and "visitescribe-001" in page
+
+    # unbinding puts it back on the unattached list
+    assert server.admin.post("/admin/api/devices/visitescribe-001/owner",
+                             json={"user_id": ""}).status_code == 200
+    assert [d["device_id"] for d in users.unbound_devices()] == ["visitescribe-001"]
+
+
+def test_adding_a_user_reports_real_errors(server):
+    server.admin_login()
+    server.admin.post("/admin/api/users", json={"email": "dokter@praktijk.nl"})
+
+    again = server.admin.post("/admin/api/users", json={"email": "dokter@praktijk.nl"})
+    assert again.status_code >= 400
+    assert "bestaat al" in again.json()["error"]["message"]
+
+    bad = server.admin.post("/admin/api/users", json={"email": "geen-adres"})
+    assert bad.status_code >= 400
+    assert "e-mailadres" in bad.json()["error"]["message"]
+
+
+def test_user_admin_endpoints_require_a_signed_in_admin(server):
+    for method, url, body in (
+        ("post", "/admin/api/users", {"email": "x@y.nl"}),
+        ("post", "/admin/api/users/whatever/enabled", {"enabled": False}),
+        ("post", "/admin/api/devices/visitescribe-001/owner", {"user_id": ""}),
+    ):
+        resp = getattr(server.admin, method)(url, json=body)
+        assert resp.status_code in (401, 403), f"{url} -> {resp.status_code}"
+
+
+def test_a_disabled_user_cannot_sign_in(site, fake_ourmind, server):
+    from app import users
+
+    user = users.create("dokter@praktijk.nl")
+    server.admin_login()
+    server.admin.post(f"/admin/api/users/{user['user_id']}/enabled",
+                      json={"enabled": False})
+
+    resp = _sign_in(site)
+    assert resp.status_code == 200
+    assert "uitgeschakeld" in resp.text.lower()
