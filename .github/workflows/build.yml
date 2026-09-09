@@ -21,12 +21,43 @@ jobs:
         with:
           python-version: '3.12'
           cache: pip
-      - name: Install libsndfile
-        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends libsndfile1
+      # The PyPI soundfile wheel already bundles libsndfile, so this is a
+      # convenience, not a requirement -- and as a required step it put a
+      # Ubuntu mirror on the critical path. Two runs failed here with apt's
+      # exit code 100 while the code was fine. Retried, and never fatal; the
+      # real check is the decode probe below, which fails loudly and says why.
+      - name: Install libsndfile (best effort)
+        continue-on-error: true
+        run: |
+          for attempt in 1 2 3; do
+            sudo apt-get update && \
+              sudo apt-get install -y --no-install-recommends libsndfile1 && exit 0
+            echo "apt attempt $attempt failed; retrying"
+            sleep 5
+          done
+          echo "could not install libsndfile from apt; relying on the wheel"
       - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
           pip install -r requirements-dev.txt numpy
+      - name: Check the audio stack can actually decode and encode
+        run: |
+          python - <<'PROBE'
+          import io, numpy as np, soundfile as sf
+          print("libsndfile", sf.__libsndfile_version__)
+          have = sf.available_formats()
+          missing = [f for f in ("FLAC", "WAV", "MP3", "OGG") if f not in have]
+          if missing:
+              raise SystemExit(f"libsndfile cannot handle {missing}; "
+                               "OurMind uploads need a container it accepts")
+          buf = io.BytesIO()
+          tone = (np.sin(np.arange(16000) * 0.05) * 8000).astype("int16")
+          sf.write(buf, tone, 16000, format="FLAC", subtype="PCM_16")
+          buf.seek(0)
+          back, rate = sf.read(buf, dtype="int16")
+          assert rate == 16000 and len(back) == 16000, (rate, len(back))
+          print("FLAC round-trip ok")
+          PROBE
       - name: Run the acceptance suite
         run: pytest tests/ -q
 
