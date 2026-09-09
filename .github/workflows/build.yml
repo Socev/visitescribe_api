@@ -93,6 +93,21 @@ jobs:
       contents: read
       packages: write
     steps:
+      - uses: actions/checkout@v4
+
+      # Every build gets an immutable, unique tag. A floating tag like :latest
+      # is a trap for a Kubernetes deploy: the node may serve a cached layer,
+      # and an unchanged tag is an unchanged pod spec, so an upgrade can end up
+      # not restarting anything at all. The chart pins <version>-<short sha>.
+      - name: Derive the build tag
+        id: ver
+        run: |
+          VERSION=$(sed -n 's/^__version__ = "\(.*\)"/\1/p' app/__init__.py)
+          SHORT=$(git rev-parse --short=7 HEAD)
+          echo "version=$VERSION"        >> "$GITHUB_OUTPUT"
+          echo "build=$VERSION-$SHORT"   >> "$GITHUB_OUTPUT"
+          echo "Building $VERSION-$SHORT"
+
       - uses: actions/download-artifact@v4
         with:
           path: /tmp/digests
@@ -113,10 +128,10 @@ jobs:
         with:
           images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
           tags: |
+            type=raw,value=${{ steps.ver.outputs.build }}
+            type=raw,value=${{ steps.ver.outputs.version }}
             type=raw,value=latest,enable={{is_default_branch}}
             type=ref,event=branch
-            type=semver,pattern={{version}}
-            type=semver,pattern={{major}}.{{minor}}
             type=sha,format=long
 
       - name: Create the multi-arch manifest
@@ -129,4 +144,8 @@ jobs:
       - name: Show what was published
         run: |
           docker buildx imagetools inspect \
-            "${REGISTRY}/${IMAGE_NAME}:${{ steps.meta.outputs.version }}"
+            "${REGISTRY}/${IMAGE_NAME}:${{ steps.ver.outputs.build }}"
+
+      - name: The tag to pin in the Olares chart
+        run: |
+          echo "::notice title=Pin this image::${REGISTRY}/${IMAGE_NAME}:${{ steps.ver.outputs.build }}"
