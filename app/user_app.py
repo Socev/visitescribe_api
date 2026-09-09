@@ -241,23 +241,27 @@ def create_user_app() -> FastAPI:
         your scroll position every few seconds.
         """
         user = userauth.require_user(request)
+        # Rows, not dicts: read them through row_to_dict so a missing row is
+        # an empty mapping rather than an AttributeError on a page that polls.
         if opname:
             _recording_of(user["user_id"], opname)      # authorisation
-            row = db.query_one(
+            jobs = db.row_to_dict(db.query_one(
                 "SELECT COUNT(*) AS n, MAX(updated_at) AS u FROM processing_jobs "
-                "WHERE session_id = ?", (opname,))
-            res = db.query_one(
+                "WHERE session_id = ?", (opname,))) or {}
+            res = db.row_to_dict(db.query_one(
                 "SELECT (SELECT COUNT(*) FROM transcripts WHERE session_id = ?) "
-                "+ (SELECT COUNT(*) FROM notes WHERE session_id = ?) AS n", (opname, opname))
-            state = db.query_one("SELECT state FROM sessions WHERE session_id = ?",
-                                 (opname,))
-            mark = f"{row['n']}:{row['u']}:{res['n']}:{state['state']}"
+                "+ (SELECT COUNT(*) FROM notes WHERE session_id = ?) AS n",
+                (opname, opname))) or {}
+            state = db.row_to_dict(db.query_one(
+                "SELECT state FROM sessions WHERE session_id = ?", (opname,))) or {}
+            mark = (f"{jobs.get('n')}:{jobs.get('u')}:{res.get('n')}:"
+                    f"{state.get('state')}")
         else:
-            row = db.query_one(
+            row = db.row_to_dict(db.query_one(
                 "SELECT COUNT(*) AS n, MAX(s.updated_at) AS u FROM sessions s "
                 "JOIN devices d ON d.device_id = s.device_id WHERE d.user_id = ?",
-                (user["user_id"],))
-            mark = f"{row['n']}:{row['u']}"
+                (user["user_id"],))) or {}
+            mark = f"{row.get('n')}:{row.get('u')}"
         return JSONResponse({"stand": mark})
 
     @app.get("/healthz")

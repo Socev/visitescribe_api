@@ -290,16 +290,23 @@ def create_admin_app() -> FastAPI:
     async def session_stand(session_id: str, request: Request) -> JSONResponse:  # noqa: ANN202
         """A cheap fingerprint, so the page can reload only when it must."""
         guard(request)
-        jobs = db.query_one(
+        # db.query_one hands back a sqlite3.Row, which is NOT a dict: it has
+        # no .get(). Writing `(row or {}).get(...)` looked like a safe default
+        # and threw AttributeError on every call instead -- and since the page
+        # polls this every eight seconds, it produced a 500 every eight
+        # seconds in the pod log.
+        jobs = db.row_to_dict(db.query_one(
             "SELECT COUNT(*) AS n, MAX(updated_at) AS u FROM processing_jobs "
-            "WHERE session_id = ?", (session_id,))
-        chunks = db.query_one(
-            "SELECT COUNT(*) AS n FROM chunks WHERE session_id = ?", (session_id,))
-        state = db.query_one(
-            "SELECT state, updated_at FROM sessions WHERE session_id = ?", (session_id,))
-        return JSONResponse({"stand": f"{jobs['n']}:{jobs['u']}:{chunks['n']}:"
-                                      f"{(state or {}).get('state')}:"
-                                      f"{(state or {}).get('updated_at')}"})
+            "WHERE session_id = ?", (session_id,))) or {}
+        chunks = db.row_to_dict(db.query_one(
+            "SELECT COUNT(*) AS n FROM chunks WHERE session_id = ?",
+            (session_id,))) or {}
+        state = db.row_to_dict(db.query_one(
+            "SELECT state, updated_at FROM sessions WHERE session_id = ?",
+            (session_id,))) or {}
+        return JSONResponse({"stand": f"{jobs.get('n')}:{jobs.get('u')}:"
+                                      f"{chunks.get('n')}:{state.get('state')}:"
+                                      f"{state.get('updated_at')}"})
 
     @app.post("/admin/api/sessions/{session_id}/processing/cancel",
               include_in_schema=False)

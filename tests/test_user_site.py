@@ -728,3 +728,55 @@ def test_a_silent_worker_with_work_waiting_is_reported_as_stalled(server,
     body = server.client.get("/readyz").json()
     assert body["status"] == "degraded"
     assert any("worker last seen" in p for p in body["problems"])
+
+
+def test_both_status_endpoints_actually_answer(server, fake_ourmind, monkeypatch):
+    """These are polled every eight seconds; a 500 here floods the log.
+
+    The admin one did exactly that: `(row or {}).get(...)` looks like a safe
+    default but sqlite3.Row is not a dict and has no .get(), so every call
+    raised AttributeError. It was never called by a test -- only asserted to
+    be present in the page.
+    """
+    monkeypatch.setenv("VS_OURMIND_TOKEN", "test-token")
+    server.register_device("visitescribe-001")
+    rec = Recorder(server)
+    rec.add_chunk(seconds=1.0)
+    rec.create(); rec.upload_all(); rec.complete()
+
+    server.admin_login()
+    r = server.admin.get(f"/admin/api/sessions/{rec.session_id}/stand")
+    assert r.status_code == 200, r.text
+    first = r.json()["stand"]
+
+    from app import processing
+
+    processing.enqueue(rec.session_id, "ourmind", actor="test")
+    assert server.admin.get(
+        f"/admin/api/sessions/{rec.session_id}/stand").json()["stand"] != first
+
+    # a session that does not exist must answer, not explode
+    assert server.admin.get(
+        "/admin/api/sessions/does-not-exist/stand").status_code == 200
+
+
+def test_the_status_endpoints_survive_a_purged_session(site, fake_ourmind, server):
+    from app import sessions, users
+
+    user = users.create("dokter@praktijk.nl")
+    server.register_device("visitescribe-001")
+    users.bind_device("visitescribe-001", user["user_id"])
+    _sign_in(site)
+
+    rec = Recorder(server, device_id="visitescribe-001")
+    rec.add_chunk(seconds=1.0)
+    rec.create(); rec.upload_all(); rec.complete()
+
+    assert site.get(f"/api/stand?opname={rec.session_id}").status_code == 200
+    server.admin_login()
+    server.admin.post(f"/admin/api/sessions/{rec.session_id}/purge",
+                      json={"scope": "all"})
+    # purged is not gone; the page must still be able to ask about it
+    assert site.get("/api/stand").status_code == 200
+    assert server.admin.get(
+        f"/admin/api/sessions/{rec.session_id}/stand").status_code == 200
