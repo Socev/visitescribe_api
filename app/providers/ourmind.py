@@ -134,7 +134,7 @@ class OurMindProvider:
 
     def _call(self, method: str, path: str, *, json_body: dict | None = None,
               content: Any = None, content_type: str | None = None,
-              timeout: float | None = None) -> Any:
+              timeout: float | None = None, absent_is_empty: bool = False) -> Any:
         # Accept-Language decides the language of the report. Dutch is NOT the
         # system default -- it is what you get by asking for it. Verified
         # against the documentation after an earlier claim to the contrary.
@@ -159,6 +159,13 @@ class OurMindProvider:
             )
         if response.status_code >= 500:
             raise ProviderError(f"OurMind serverfout {response.status_code}", retryable=True)
+        if response.status_code == 404 and absent_is_empty:
+            # "no reports found; you can generate one (report-404)" is not a
+            # failure -- it is how OurMind says "not yet". Generation is
+            # asynchronous, so the list 404s until the first report exists.
+            # Treating it as an error failed every recording whose report took
+            # longer than the first poll, which is why it looked intermittent.
+            return None
         if response.status_code >= 400:
             message = _explain(response)
             # Their own machine-readable marker for "I cannot read this file".
@@ -300,7 +307,8 @@ class OurMindProvider:
     def _await_transcript(self, consultation: str) -> dict:
         deadline = time.monotonic() + self.poll_budget
         while True:
-            payload = self._call("GET", f"consultation/{consultation}/transcripts") or {}
+            payload = self._call("GET", f"consultation/{consultation}/transcripts",
+                                 absent_is_empty=True) or {}
             items = payload.get("data") or []
             states = [(i.get("attributes") or {}).get("status") for i in items]
             if items and all(s == TERMINAL_OK for s in states):
@@ -317,7 +325,8 @@ class OurMindProvider:
     def _await_report(self, consultation: str) -> dict:
         deadline = time.monotonic() + self.poll_budget
         while True:
-            payload = self._call("GET", f"consultation/{consultation}/reports") or {}
+            payload = self._call("GET", f"consultation/{consultation}/reports",
+                                 absent_is_empty=True) or {}
             items = payload.get("data") or []
             if items:
                 latest = max(items, key=lambda i: int(

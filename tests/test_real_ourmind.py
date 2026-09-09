@@ -25,6 +25,14 @@ VERSION = "2025-05-07"
 
 class Handler(BaseHTTPRequestHandler):
     calls: list[dict] = []
+    # Generation is asynchronous, and while it runs OurMind answers the
+    # reports list with 404 "no reports found; you can generate one
+    # (report-404)". Not an error -- their way of saying "not yet". The fake
+    # does the same for the first few polls, because a fake that hands the
+    # report over immediately never exercises the wait, and that is exactly
+    # how this shipped broken.
+    reports_404_for: int = 2
+    transcripts_404_for: int = 0
 
     # -- plumbing --------------------------------------------------------
     def _record(self, body: bytes = b""):
@@ -89,11 +97,20 @@ class Handler(BaseHTTPRequestHandler):
         self._record()
         p = self.path
         if p.endswith("/transcripts"):
+            if Handler.transcripts_404_for > 0:
+                Handler.transcripts_404_for -= 1
+                return self._reply({"errors": [{"code": "transcript-404",
+                    "detail": "no transcripts found"}]}, code=404)
             return self._reply({"data": [{"id": "t-1", "attributes": {
                 "status": "done",
                 "segments": [{"text": "Patiente meldt hoofdpijn.", "start": 0.0,
                               "end": 2.0, "speaker_id": "speaker_1"}]}}]})
         if p.endswith("/reports"):
+            if Handler.reports_404_for > 0:
+                Handler.reports_404_for -= 1
+                return self._reply({"errors": [{"code": "report-404",
+                    "detail": "no reports found; you can generate one"}]},
+                    code=404)
             return self._reply({"data": [{"id": "r-1", "attributes": {
                 "status": "done", "generation": 1, "title": "Consult",
                 "template_id": 7, "codes": ["N01"]}}]})
@@ -120,6 +137,8 @@ def fake_ourmind(monkeypatch):
     no test can leak.
     """
     Handler.calls = []
+    Handler.reports_404_for = 2
+    Handler.transcripts_404_for = 1
     srv = HTTPServer(("127.0.0.1", 0), Handler)
     threading.Thread(target=srv.serve_forever, daemon=True).start()
     base = f"http://127.0.0.1:{srv.server_address[1]}"
@@ -227,3 +246,68 @@ def test_flac_is_refused_and_another_container_is_tried(server, fake_ourmind,
     # ...and it is remembered, so the next recording goes straight to WAV.
     assert ourmind.accepted_audio_format() == "wav"
     assert ourmind.OurMindProvider().upload_formats()[0] == "wav"
+
+
+def test_a_report_that_is_not_ready_yet_is_waited_for(server, fake_ourmind,
+                                                      monkeypatch):
+    """The failure David hit on three consecutive recordings.
+
+        ProviderError: OurMind: no reports found; you can generate one
+        (report-404)
+
+    Report generation is asynchronous. Until the first report exists the list
+    endpoint answers 404 with that message -- "not yet", not "broken". Treating
+    it as an error failed every recording whose report took longer than the
+    first poll, which is why it looked intermittent: a fast one succeeded, a
+    slow one did not.
+    """
+    from app import processing
+
+    monkeypatch.setenv("VS_OURMIND_TOKEN", "test-token")
+    Handler.reports_404_for = 3          # three polls of "not yet"
+    Handler.transcripts_404_for = 2
+
+    server.register_device("visitescribe-001")
+    rec = Recorder(server)
+    rec.add_chunk(seconds=1.0)
+    rec.create(); rec.upload_all(); rec.complete()
+
+    processing.enqueue(rec.session_id, "ourmind", actor="test")
+    assert processing.run_once() is True      # transcribe
+    assert processing.run_once() is True      # note
+
+    for job in processing.jobs_for(rec.session_id):
+        assert job.get("error") in (None, ""), f"{job['stage']}: {job.get('error')}"
+        assert job["state"] == "done", dict(job)
+
+    # it really did poll more than once rather than getting lucky
+    report_polls = [c for c in Handler.calls
+                    if c["method"] == "GET" and c["path"].endswith("/reports")]
+    assert len(report_polls) >= 4
+
+    results = processing.results_for(rec.session_id)
+    assert "hoofdpijn sinds drie dagen" in results["notes"][0]["body"]
+
+
+def test_a_report_that_never_arrives_still_gives_up(server, fake_ourmind,
+                                                    monkeypatch):
+    """Waiting must not become waiting forever."""
+    from app import processing
+
+    monkeypatch.setenv("VS_OURMIND_TOKEN", "test-token")
+    monkeypatch.setenv("VS_OURMIND_POLL_BUDGET", "1")
+    Handler.reports_404_for = 10_000
+
+    server.register_device("visitescribe-001")
+    rec = Recorder(server)
+    rec.add_chunk(seconds=1.0)
+    rec.create(); rec.upload_all(); rec.complete()
+
+    processing.enqueue(rec.session_id, "ourmind", actor="test")
+    processing.run_once()
+    processing.run_once()
+
+    note = [j for j in processing.jobs_for(rec.session_id) if j["stage"] == "note"][0]
+    assert "te lang" in (note["error"] or "")
+    # retryable, so it waits and tries again rather than being written off
+    assert note["state"] == "queued"
