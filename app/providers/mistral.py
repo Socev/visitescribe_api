@@ -84,13 +84,20 @@ class MistralProvider:
             "model": self.asr_model,
             "diarize": "true",
         }
-        # Mistral documents timestamp_granularities as incompatible with
-        # `language`, so this picks one: an explicit language is worth more for
-        # a known-Dutch recording than segment timings are.
+        # Both, always. An earlier version treated `language` and
+        # `timestamp_granularities` as mutually exclusive, on the strength of a
+        # line in the documentation. The API itself says otherwise:
+        #
+        #   422: "When diarize is set to True and streaming is disabled, the
+        #   timestamp granularity must be set to ['segment'], got []"
+        #
+        # and its echo of the rejected request shows `language: "nl"` sitting
+        # there unobjected to. With diarize on, segment granularity is not
+        # optional -- speaker turns are segments, so there is nothing to
+        # attach a speaker to without them.
+        data["timestamp_granularities"] = "segment"
         if language:
             data["language"] = language
-        else:
-            data["timestamp_granularities"] = "segment"
         bias = [str(term) for term in (context.get("context_bias") or [])]
         if bias:
             data["context_bias"] = bias

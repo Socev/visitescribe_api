@@ -25,6 +25,18 @@ import pytest
 from conftest import Recorder
 
 
+def _form_fields(body: bytes) -> dict[str, list[str]]:
+    """The non-file fields of a multipart body, by name."""
+    out: dict[str, list[str]] = {}
+    for part in body.split(b"\r\n--"):
+        if b'name="' not in part or b"filename=" in part:
+            continue
+        head, _, value = part.partition(b"\r\n\r\n")
+        name = head.split(b'name="', 1)[1].split(b'"', 1)[0].decode()
+        out.setdefault(name, []).append(value.rstrip(b"\r\n-").decode("utf-8", "replace"))
+    return out
+
+
 class Handler(BaseHTTPRequestHandler):
     seen: list[dict] = []
 
@@ -38,6 +50,20 @@ class Handler(BaseHTTPRequestHandler):
             "body": body,
         })
         if self.path.endswith("/audio/transcriptions"):
+            # Mirror the server's own rule. A fake that accepts anything proves
+            # nothing: the first version of this client sent no
+            # timestamp_granularities and this test still passed, while the
+            # real API answered 422. Verbatim from that rejection.
+            fields = _form_fields(body)
+            if fields.get("diarize") == ["true"] and \
+                    fields.get("timestamp_granularities") != ["segment"]:
+                return self._reply({"object": "error", "message": {"detail": [{
+                    "type": "assertion_error", "loc": [],
+                    "msg": "Assertion failed, When diarize is set to True and "
+                           "streaming is disabled, the timestamp granularity "
+                           "must be set to ['segment'], got "
+                           f"{fields.get('timestamp_granularities', [])}",
+                }]}}, code=422)
             payload = {
                 "text": "Patiente meldt hoofdpijn sinds drie dagen.",
                 "language": "nl",
@@ -54,8 +80,11 @@ class Handler(BaseHTTPRequestHandler):
                 "usage": {"prompt_tokens": 500, "completion_tokens": 80,
                           "total_tokens": 580},
             }
+        self._reply(payload)
+
+    def _reply(self, payload, code=200):
         raw = json.dumps(payload).encode()
-        self.send_response(200)
+        self.send_response(code)
         self.send_header("content-type", "application/json")
         self.send_header("content-length", str(len(raw)))
         self.end_headers()
@@ -108,6 +137,8 @@ def test_real_mistral_client_runs_a_real_session(server, fake_mistral, monkeypat
     assert b'name="model"' in body and b"voxtral-mini-2602" in body
     assert b'name="diarize"' in body
     assert b'name="language"' in body and b"nl" in body
+    # diarize without segment granularity is a 422 from Mistral itself
+    assert b'name="timestamp_granularities"' in body and b"segment" in body
     # the audio itself, not just its name: two 1-second chunks of real FLAC
     assert b'name="file"' in body and b"filename=" in body
     assert b"fLaC" in body
