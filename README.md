@@ -300,13 +300,13 @@ The image is built by GitHub Actions and published to
 `ghcr.io/socev/visitescribe_api`, multi-arch (`amd64` + `arm64`, both on native
 runners).
 
-> **One-time manual step.** GitHub publishes new container packages as
-> **private**, whatever the repository's visibility, and there is no API or CLI
-> to change it. After the first successful build, go to your GitHub profile →
-> **Packages** → `visitescribe_api` → **Package settings** → **Danger Zone** →
-> **Change visibility** → **Public**. Public `ghcr.io` images pull anonymously,
-> so once that is done the Olares node needs no pull secret. Until then the pod
-> will sit in `ImagePullBackOff`.
+> **Check the package is public.** GitHub sometimes publishes a new container
+> package as private. This one came out public and pulls anonymously — verified
+> against `ghcr.io` with no credentials — so the Olares node needs no pull
+> secret. If a pod ever sits in `ImagePullBackOff` with a 401, that is what to
+> check: GitHub profile → **Packages** → `visitescribe_api` → **Package
+> settings** → **Danger Zone** → **Change visibility** → **Public**. There is no
+> API or CLI for it; it has to be done in the web UI.
 
 The Olares chart lives in `Socev/visitescribe_api_pod`.
 
