@@ -1,16 +1,20 @@
-"""FLAC container validation.
+"""Lossless recorder-audio container validation.
 
-Two layers:
+The original recorder uploads FLAC chunks; the CoreS3-Lite records canonical
+PCM WAV locally and uploads independently valid WAV chunks.  Both are lossless
+and both are fully authenticated by AES-GCM before this module sees them.
 
-1. **Structural** (always available, no dependencies): the `fLaC` magic, a
-   well-formed STREAMINFO block, a sane metadata block chain, and a valid
-   frame sync code at the start of the audio data. Yields sample rate,
-   channel count, bit depth and duration.
-2. **Deep** (when libsndfile is present): the stream is actually decoded.
-   When STREAMINFO carries a non-zero MD5 of the unencoded audio, the decoded
-   PCM is hashed and compared, which catches silent corruption the GCM tag
-   would not (because the ciphertext was authentic but the plaintext was
-   encoded from damaged input).
+Validation has two layers:
+
+1. **Structural** (always available): FLAC STREAMINFO/frame checks or RIFF/WAVE
+   PCM header/chunk checks.  This yields sample rate, channel count, bit depth
+   and duration without trusting large decoder allocations.
+2. **Deep** (when libsndfile is present): the stream is actually decoded in
+   bounded blocks.  FLAC additionally verifies STREAMINFO MD5 when present.
+
+``FlacInfo`` and ``FlacError`` retain their historical names because they are
+part of the server's internal/public diagnostic shape.  The fields are generic
+for either accepted lossless container.
 """
 from __future__ import annotations
 
@@ -29,13 +33,16 @@ except Exception:  # noqa: BLE001
     _soundfile = None
 
 FLAC_MAGIC = b"fLaC"
+WAV_RIFF = b"RIFF"
+WAV_WAVE = b"WAVE"
 
 # A FLAC stream of digital silence compresses enormously: a few hundred KiB of
 # ciphertext can declare hours of audio, and decoding it would allocate
 # gigabytes. Both limits are checked from the header *before* any decode, and
 # again while streaming, so a malicious or malfunctioning recorder cannot
-# exhaust the pod's memory with one upload.
-MAX_DECODED_BYTES = 64 * 1024 * 1024      # ~5.5 minutes of 48 kHz mono, int32
+# exhaust the pod's memory with one upload. WAV is bounded by the same decoded
+# limit even though its stored PCM is already uncompressed.
+MAX_DECODED_BYTES = 64 * 1024 * 1024
 MAX_TOTAL_SAMPLES = 1 << 32
 DECODE_BLOCK_FRAMES = 65536
 
@@ -50,7 +57,7 @@ BLOCK_INVALID = 127
 
 
 class FlacError(ValueError):
-    """The bytes are not a usable FLAC stream."""
+    """The bytes are not a usable supported lossless audio stream."""
 
 
 @dataclass
@@ -88,7 +95,7 @@ class FlacInfo:
 def _read_streaminfo(block: bytes) -> dict[str, int | str]:
     if len(block) != 34:
         raise FlacError(f"STREAMINFO must be 34 bytes, got {len(block)}")
-    bits = int.from_bytes(block[:18], "big")  # first 144 bits
+    bits = int.from_bytes(block[:18], "big")
     min_block = (bits >> 128) & 0xFFFF
     max_block = (bits >> 112) & 0xFFFF
     min_frame = (bits >> 88) & 0xFFFFFF
@@ -120,7 +127,7 @@ def _read_streaminfo(block: bytes) -> dict[str, int | str]:
 
 
 def parse_structure(data: bytes) -> FlacInfo:
-    """Validate the container and return what STREAMINFO declares."""
+    """Validate a FLAC container and return what STREAMINFO declares."""
     if len(data) < 42:
         raise FlacError("stream is too short to be FLAC")
     if data[:4] != FLAC_MAGIC:
@@ -160,8 +167,6 @@ def parse_structure(data: bytes) -> FlacInfo:
         raise FlacError("metadata block chain has no last-block marker")
     if pos + 2 > len(data):
         raise FlacError("no audio frames after metadata")
-
-    # Frame sync code: 14 bits of 1s then 0 then the blocking strategy bit.
     if (int.from_bytes(data[pos : pos + 2], "big") & 0xFFFE) != 0xFFF8:
         raise FlacError("first audio frame has no valid sync code")
 
@@ -181,11 +186,92 @@ def parse_structure(data: bytes) -> FlacInfo:
         min_block_size=int(info["min_block_size"]),
         max_block_size=int(info["max_block_size"]),
         md5=str(info["md5"]),
-        decoder="structural",
+        decoder="structural-flac",
     )
     if total == 0:
         result.warnings.append("STREAMINFO declares 0 total samples (streamed encode)")
     return result
+
+
+def parse_wav_structure(data: bytes,
+                        max_decoded_bytes: int = MAX_DECODED_BYTES) -> FlacInfo:
+    """Validate RIFF/WAVE PCM without relying on a decoder.
+
+    The CoreS3 currently emits PCM16 canonical WAV chunks, but the parser walks
+    RIFF chunks instead of assuming a fixed 44-byte header so harmless metadata
+    chunks remain forward compatible.
+    """
+    if len(data) < 44 or data[:4] != WAV_RIFF or data[8:12] != WAV_WAVE:
+        raise FlacError("missing RIFF/WAVE header")
+    declared_riff = int.from_bytes(data[4:8], "little") + 8
+    if declared_riff > len(data):
+        raise FlacError("RIFF length runs past end of stream")
+
+    pos = 12
+    fmt: tuple[int, int, int, int, int] | None = None
+    data_size: int | None = None
+    while pos + 8 <= len(data):
+        chunk_id = data[pos:pos + 4]
+        size = int.from_bytes(data[pos + 4:pos + 8], "little")
+        body = pos + 8
+        end = body + size
+        if end > len(data):
+            raise FlacError("WAV chunk runs past end of stream")
+        if chunk_id == b"fmt ":
+            if size < 16:
+                raise FlacError("WAV fmt chunk is too short")
+            audio_format = int.from_bytes(data[body:body + 2], "little")
+            channels = int.from_bytes(data[body + 2:body + 4], "little")
+            sample_rate = int.from_bytes(data[body + 4:body + 8], "little")
+            byte_rate = int.from_bytes(data[body + 8:body + 12], "little")
+            block_align = int.from_bytes(data[body + 12:body + 14], "little")
+            bits = int.from_bytes(data[body + 14:body + 16], "little")
+            # 1 = integer PCM.  The recorder deliberately uses this simplest,
+            # most interoperable form rather than WAVE_FORMAT_EXTENSIBLE.
+            if audio_format != 1:
+                raise FlacError(f"WAV format {audio_format} is not PCM")
+            if not 1 <= channels <= 8:
+                raise FlacError(f"WAV declares {channels} channels")
+            if sample_rate <= 0:
+                raise FlacError("WAV sample rate is invalid")
+            if bits not in (8, 16, 24, 32):
+                raise FlacError(f"WAV declares unsupported {bits}-bit samples")
+            expected_align = channels * ((bits + 7) // 8)
+            if block_align != expected_align:
+                raise FlacError("WAV block_align is inconsistent")
+            if byte_rate != sample_rate * block_align:
+                raise FlacError("WAV byte_rate is inconsistent")
+            fmt = (channels, sample_rate, bits, block_align, byte_rate)
+        elif chunk_id == b"data":
+            data_size = size
+            break
+        pos = end + (size & 1)
+
+    if fmt is None:
+        raise FlacError("WAV has no fmt chunk")
+    if data_size is None:
+        raise FlacError("WAV has no data chunk")
+    channels, sample_rate, bits, block_align, _ = fmt
+    if data_size > max_decoded_bytes:
+        raise FlacError(
+            f"WAV contains {data_size} decoded bytes, above the {max_decoded_bytes} limit"
+        )
+    if data_size % block_align:
+        raise FlacError("WAV data size is not frame aligned")
+    total = data_size // block_align
+    if total > MAX_TOTAL_SAMPLES:
+        raise FlacError(
+            f"WAV declares {total} samples, above the {MAX_TOTAL_SAMPLES} limit"
+        )
+    return FlacInfo(
+        valid=True,
+        sample_rate=sample_rate,
+        channels=channels,
+        bits_per_sample=bits,
+        total_samples=total,
+        duration_ms=int(round(total * 1000 / sample_rate)),
+        decoder="structural-wav",
+    )
 
 
 def _pcm_bytes(samples, bits_per_sample: int) -> bytes | None:
@@ -205,21 +291,17 @@ def _pcm_bytes(samples, bits_per_sample: int) -> bytes | None:
 
 def deep_verify(data: bytes, info: FlacInfo,
                 max_decoded_bytes: int = MAX_DECODED_BYTES) -> FlacInfo:
-    """Fully decode the stream in bounded blocks. Never raises for a missing
-    decoder, always raises for a stream that would decode too large."""
+    """Fully decode FLAC in bounded blocks."""
     if _soundfile is None or _numpy is None:
-        info.warnings.append(
-            "libsndfile or numpy unavailable; structural validation only"
-        )
+        info.warnings.append("libsndfile or numpy unavailable; structural validation only")
         return info
 
-    bytes_per_frame = max(info.channels, 1) * 4  # soundfile hands back int32
+    bytes_per_frame = max(info.channels, 1) * 4
     if info.total_samples:
         declared = info.total_samples * bytes_per_frame
         if declared > max_decoded_bytes:
             raise FlacError(
-                f"stream declares {declared} decoded bytes, above the "
-                f"{max_decoded_bytes} limit"
+                f"stream declares {declared} decoded bytes, above the {max_decoded_bytes} limit"
             )
 
     digest = hashlib.md5()  # noqa: S324 - format-mandated, not security
@@ -235,17 +317,15 @@ def deep_verify(data: bytes, info: FlacInfo,
                 raise FlacError("decoded channel count disagrees with STREAMINFO")
             if handle.frames and handle.frames * bytes_per_frame > max_decoded_bytes:
                 raise FlacError(
-                    f"stream would decode to {handle.frames * bytes_per_frame} "
-                    f"bytes, above the {max_decoded_bytes} limit"
+                    f"stream would decode to {handle.frames * bytes_per_frame} bytes, "
+                    f"above the {max_decoded_bytes} limit"
                 )
             shift = 32 - info.bits_per_sample
             for block in handle.blocks(blocksize=DECODE_BLOCK_FRAMES, dtype="int32",
                                        always_2d=True):
                 frames += int(block.shape[0])
                 if frames * bytes_per_frame > max_decoded_bytes:
-                    raise FlacError(
-                        f"stream decoded past the {max_decoded_bytes} byte limit"
-                    )
+                    raise FlacError(f"stream decoded past the {max_decoded_bytes} byte limit")
                 if md5_usable:
                     raw = _pcm_bytes(block >> shift, info.bits_per_sample)
                     if raw is None:
@@ -258,11 +338,9 @@ def deep_verify(data: bytes, info: FlacInfo,
         raise FlacError(f"stream is not decodable: {exc}") from exc
 
     if info.total_samples and frames != info.total_samples:
-        raise FlacError(
-            f"decoded {frames} frames but STREAMINFO declares {info.total_samples}"
-        )
+        raise FlacError(f"decoded {frames} frames but STREAMINFO declares {info.total_samples}")
     info.deep_verified = True
-    info.decoder = "libsndfile"
+    info.decoder = "libsndfile-flac"
     if not info.total_samples:
         info.total_samples = frames
         info.duration_ms = int(round(frames * 1000 / info.sample_rate))
@@ -274,12 +352,59 @@ def deep_verify(data: bytes, info: FlacInfo,
     return info
 
 
+def deep_verify_wav(data: bytes, info: FlacInfo,
+                    max_decoded_bytes: int = MAX_DECODED_BYTES) -> FlacInfo:
+    """Decode WAV in bounded blocks and verify the structural metadata."""
+    if _soundfile is None or _numpy is None:
+        info.warnings.append("libsndfile or numpy unavailable; structural validation only")
+        return info
+    frames = 0
+    bytes_per_frame = max(info.channels, 1) * 4
+    try:
+        with _soundfile.SoundFile(io.BytesIO(data)) as handle:
+            if handle.format not in ("WAV", "WAVEX"):
+                raise FlacError(f"libsndfile reports format {handle.format}, not WAV")
+            if handle.samplerate != info.sample_rate:
+                raise FlacError("decoded sample rate disagrees with WAV header")
+            if handle.channels != info.channels:
+                raise FlacError("decoded channel count disagrees with WAV header")
+            if handle.frames and handle.frames * bytes_per_frame > max_decoded_bytes:
+                raise FlacError(
+                    f"stream would decode to {handle.frames * bytes_per_frame} bytes, "
+                    f"above the {max_decoded_bytes} limit"
+                )
+            for block in handle.blocks(blocksize=DECODE_BLOCK_FRAMES, dtype="int32",
+                                       always_2d=True):
+                frames += int(block.shape[0])
+                if frames * bytes_per_frame > max_decoded_bytes:
+                    raise FlacError(f"stream decoded past the {max_decoded_bytes} byte limit")
+    except FlacError:
+        raise
+    except Exception as exc:  # noqa: BLE001
+        raise FlacError(f"stream is not decodable: {exc}") from exc
+    if frames != info.total_samples:
+        raise FlacError(
+            f"decoded {frames} frames but WAV header declares {info.total_samples}"
+        )
+    info.deep_verified = True
+    info.decoder = "libsndfile-wav"
+    return info
+
+
 def validate(data: bytes, deep: bool = True,
              max_decoded_bytes: int = MAX_DECODED_BYTES) -> FlacInfo:
-    info = parse_structure(data)
-    if deep:
-        info = deep_verify(data, info, max_decoded_bytes=max_decoded_bytes)
-    return info
+    """Validate an authenticated FLAC or PCM WAV recorder chunk."""
+    if data[:4] == FLAC_MAGIC:
+        info = parse_structure(data)
+        if deep:
+            info = deep_verify(data, info, max_decoded_bytes=max_decoded_bytes)
+        return info
+    if data[:4] == WAV_RIFF and len(data) >= 12 and data[8:12] == WAV_WAVE:
+        info = parse_wav_structure(data, max_decoded_bytes=max_decoded_bytes)
+        if deep:
+            info = deep_verify_wav(data, info, max_decoded_bytes=max_decoded_bytes)
+        return info
+    raise FlacError("payload is neither FLAC nor PCM WAV")
 
 
 def check_against_manifest(info: FlacInfo, audio: dict[str, Any]) -> list[str]:
@@ -288,19 +413,19 @@ def check_against_manifest(info: FlacInfo, audio: dict[str, Any]) -> list[str]:
     declared_rate = audio.get("sample_rate")
     if isinstance(declared_rate, int) and declared_rate and declared_rate != info.sample_rate:
         problems.append(
-            f"manifest declares sample_rate {declared_rate} but the FLAC is {info.sample_rate}"
+            f"manifest declares sample_rate {declared_rate} but the audio is {info.sample_rate}"
         )
     declared_channels = audio.get("channels")
     if isinstance(declared_channels, int) and declared_channels and declared_channels != info.channels:
         problems.append(
-            f"manifest declares {declared_channels} channels but the FLAC has {info.channels}"
+            f"manifest declares {declared_channels} channels but the audio has {info.channels}"
         )
     fmt = audio.get("sample_format")
     if isinstance(fmt, str) and fmt:
         expected = {"S16_LE": 16, "S24_LE": 24, "S32_LE": 32, "S8": 8, "U8": 8}.get(fmt.upper())
         if expected and expected != info.bits_per_sample:
             problems.append(
-                f"manifest declares {fmt} but the FLAC is {info.bits_per_sample}-bit"
+                f"manifest declares {fmt} but the audio is {info.bits_per_sample}-bit"
             )
     return problems
 
