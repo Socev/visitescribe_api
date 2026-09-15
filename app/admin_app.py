@@ -16,8 +16,8 @@ from contextlib import asynccontextmanager
 from fastapi import FastAPI, Request, Response
 from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse, StreamingResponse
 
-from . import (__version__, adminauth, audit, crypto, db, flacinfo, pricing,
-               processing, routing, sessions, storage, users)
+from . import (__version__, adminauth, audio, audit, crypto, db, flacinfo,
+               pricing, processing, routing, sessions, storage, users)
 from .providers import credentials as provider_credentials
 from .providers import get as get_provider
 from .admin_html import (
@@ -435,10 +435,15 @@ def create_admin_app() -> FastAPI:
         plaintext = _decrypt_chunk(session_id, row)
         audit.log("export", "chunk_downloaded", "success", session_id=session_id,
                   sequence=sequence, identity=who, detail={"form": "decrypted"})
+        # The blob is named .flac whatever the recorder sent, so the label on
+        # the way out comes from the bytes: a CoreS3 chunk is PCM WAV and would
+        # otherwise be handed over as a FLAC that will not open.
+        kind = flacinfo.container(plaintext) or "flac"
+        media = audio.content_type(kind)
         return Response(
-            content=plaintext, media_type="audio/flac",
+            content=plaintext, media_type=media,
             headers={"Content-Disposition":
-                     f'attachment; filename="{session_id}-{sequence:06d}.flac"'},
+                     f'attachment; filename="{session_id}-{sequence:06d}.{kind}"'},
         )
 
     @app.get("/admin/api/sessions/{session_id}/audio.wav", include_in_schema=False)
@@ -952,9 +957,11 @@ def _session_wav(session_id: str) -> bytes:
                 raise ApiError("INVALID_REQUEST",
                                "Chunks have inconsistent audio parameters")
             blocks.append(handle.read(dtype="int16", always_2d=True))
-    audio = np.concatenate(blocks, axis=0)
+    # Not named `audio`: that is the module this file imports, and shadowing it
+    # here would make any later use of it in this function a NameError.
+    samples = np.concatenate(blocks, axis=0)
     out = io.BytesIO()
-    sf.write(out, audio, rate, format="WAV", subtype="PCM_16")
+    sf.write(out, samples, rate, format="WAV", subtype="PCM_16")
     return out.getvalue()
 
 

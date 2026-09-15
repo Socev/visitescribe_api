@@ -1,8 +1,9 @@
 # VisiteScribe Ingest API
 
-Server side of **VisiteScribe**, the Raspberry Pi medical audio recorder. The Pi
-records audio, encodes each block to FLAC, encrypts it locally with AES-256-GCM
-and uploads only ciphertext. This service is the other half of that contract: it
+Server side of **VisiteScribe**, the medical audio recorder. The recorder writes
+each block as lossless audio — FLAC on the Raspberry Pi, PCM WAV on the
+CoreS3-Lite — encrypts it locally with AES-256-GCM and uploads only ciphertext.
+This service is the other half of that contract: it
 receives, verifies, and durably stores encrypted sessions, and tells the recorder
 when it is safe to delete its local copy.
 
@@ -100,16 +101,26 @@ Each `PUT` is refused unless **all** of this holds, in this order:
    **byte for byte** — taken from the raw request headers, never trimmed,
    normalised, lowercased, re-serialised or re-encoded.
 6. `SHA-256(plaintext)` equals `X-Plaintext-SHA256`.
-7. The plaintext is genuinely FLAC: `fLaC` magic, a well-formed STREAMINFO, a
-   valid metadata chain and a real frame sync code — then a full libsndfile
-   decode in bounded blocks, and when STREAMINFO carries an MD5 of the
-   unencoded audio, the decoded PCM is hashed and compared. That last check
+7. The plaintext is genuinely one of the two accepted lossless containers.
+   **FLAC** — what the original recorder produces: `fLaC` magic, a well-formed
+   STREAMINFO, a valid metadata chain and a real frame sync code, then a full
+   libsndfile decode in bounded blocks, and when STREAMINFO carries an MD5 of
+   the unencoded audio, the decoded PCM is hashed and compared. That last check
    catches corruption an authentic GCM tag cannot: audio damaged *before* it
-   was encrypted.
+   was encrypted. **PCM WAV** — what the CoreS3-Lite records locally: a RIFF
+   chunk walk (so a recorder that writes a LIST/INFO block still passes), an
+   integer-PCM `fmt ` whose `block_align` and `byte_rate` agree with the rate,
+   channels and bit depth it declares, a frame-aligned `data` chunk that fits
+   inside the bytes uploaded, and then the same bounded decode. A compressed
+   WAV is refused: the stored audio has to stay lossless.
+   Mixed containers within one session are accepted and reassemble normally.
 8. The stream does not decode to more than `VS_MAX_DECODED_BYTES`. FLAC of
    digital silence compresses several thousand to one, so a few hundred
    kilobytes on the wire could otherwise allocate gigabytes; the limit is
-   checked from the header before any decoding starts.
+   checked from the header before any decoding starts. It counts the audio at
+   the width libsndfile hands back — int32 frames — for either container, so
+   the door and the decoder refuse the same streams even with
+   `VS_FLAC_DEEP_VERIFY` off.
 9. Sample rate, channel count and bit depth agree with the manifest.
 
 Only then is the ciphertext written (temp file → `fsync` → rename →

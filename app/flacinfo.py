@@ -252,10 +252,6 @@ def parse_wav_structure(data: bytes,
     if data_size is None:
         raise FlacError("WAV has no data chunk")
     channels, sample_rate, bits, block_align, _ = fmt
-    if data_size > max_decoded_bytes:
-        raise FlacError(
-            f"WAV contains {data_size} decoded bytes, above the {max_decoded_bytes} limit"
-        )
     if data_size % block_align:
         raise FlacError("WAV data size is not frame aligned")
     total = data_size // block_align
@@ -263,7 +259,18 @@ def parse_wav_structure(data: bytes,
         raise FlacError(
             f"WAV declares {total} samples, above the {MAX_TOTAL_SAMPLES} limit"
         )
-    return FlacInfo(
+    # The limit counts what the audio becomes in memory, not what it weighs on
+    # the wire: libsndfile hands every container back as int32 frames. Counting
+    # WAV's stored bytes instead would let a stream through this door at up to
+    # twice the size the decoder will refuse -- and with deep verification off
+    # it would be accepted here and only fail later, during reassembly.
+    declared = total * channels * 4
+    if declared > max_decoded_bytes:
+        raise FlacError(
+            f"stream declares {declared} decoded bytes, above the "
+            f"{max_decoded_bytes} limit"
+        )
+    result = FlacInfo(
         valid=True,
         sample_rate=sample_rate,
         channels=channels,
@@ -272,6 +279,9 @@ def parse_wav_structure(data: bytes,
         duration_ms=int(round(total * 1000 / sample_rate)),
         decoder="structural-wav",
     )
+    if total == 0:
+        result.warnings.append("WAV data chunk is empty")
+    return result
 
 
 def _pcm_bytes(samples, bits_per_sample: int) -> bytes | None:
@@ -389,6 +399,20 @@ def deep_verify_wav(data: bytes, info: FlacInfo,
     info.deep_verified = True
     info.decoder = "libsndfile-wav"
     return info
+
+
+def container(data: bytes) -> str | None:
+    """Which accepted container these bytes are, from the magic alone.
+
+    Chunks are stored under a .flac blob name whatever the recorder sent, so
+    anything that hands a chunk back -- an admin download, a debug export --
+    has to look at the bytes rather than the file name to label it correctly.
+    """
+    if data[:4] == FLAC_MAGIC:
+        return "flac"
+    if data[:4] == WAV_RIFF and len(data) >= 12 and data[8:12] == WAV_WAVE:
+        return "wav"
+    return None
 
 
 def validate(data: bytes, deep: bool = True,
