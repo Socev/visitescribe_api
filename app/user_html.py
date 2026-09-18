@@ -18,6 +18,11 @@ EXTRA_CSS = """
 .hero{display:flex;gap:18px;align-items:flex-start;flex-wrap:wrap;margin-bottom:6px}
 .hero .who{font-size:13px;color:var(--muted)}
 .cards{display:grid;gap:12px;grid-template-columns:repeat(auto-fit,minmax(280px,1fr))}
+.cards+.day{margin-top:28px}
+.day{display:flex;align-items:center;gap:12px;margin:18px 0 10px;font-size:13px;
+ font-weight:600;letter-spacing:.02em;text-transform:uppercase;color:var(--muted)}
+.day::after{content:"";flex:1;height:1px;background:var(--line)}
+.rec .when{font-size:17px}
 .rec{background:var(--panel);border:1px solid var(--line);border-radius:10px;padding:14px 16px}
 .rec .when{font-weight:600;letter-spacing:-.01em}
 .rec .meta{color:var(--muted);font-size:12.5px;margin-top:2px}
@@ -193,8 +198,14 @@ def render_recordings(d: dict[str, Any], who: str) -> str:
         cards = """<div class="panel"><div class="empty">
 Nog geen opnames. Zodra je recorder iets instuurt verschijnt het hier.</div></div>"""
     else:
-        cards = '<div class="cards">' + "".join(
-            f"""<div class="rec">
+        # One grid per day, newest day first, with the date written once above
+        # it instead of on every card. The day is the practice's day, so a
+        # consultation at 00:30 sits under the night it belongs to, not under
+        # the UTC date the row was stored with.
+        cards = ""
+        for label, day_rows in _by_day(rows):
+            cards += f'<h2 class="day">{_e(label)}</h2><div class="cards">' + "".join(
+                f"""<div class="rec">
 <div class="when">{_e(_when(r))}</div>
 <div class="meta">{_e(types.get(r['mode'], {}).get('title') or r['mode'])}
  · {_e(_duration(r.get('duration_seconds')))}
@@ -203,8 +214,7 @@ Nog geen opnames. Zodra je recorder iets instuurt verschijnt het hier.</div></di
 {'<span class="pill">' + _e(r['route']) + '</span>' if r.get('route') else ''}
 <span class="spacer" style="flex:1"></span>
 <a href="/opname/{_e(r['session_id'])}">bekijken</a></div>
-</div>""" for r in rows)
-        cards += "</div>"
+</div>""" for r in day_rows) + "</div>"
     return layout("Mijn opnames", f"""
 <div class="hero"><div><h1>Mijn opnames</h1>
 <p class="sub">Alles wat jouw recorder heeft ingestuurd.
@@ -213,16 +223,42 @@ Nog geen opnames. Zodra je recorder iets instuurt verschijnt het hier.</div></di
 <script>watch('/api/stand');</script>""", active="opnames", who=who)
 
 
+def _started(row: dict[str, Any]) -> str:
+    return row.get("started_at") or row.get("created_at") or ""
+
+
 def _when(row: dict[str, Any]) -> str:
     """On the practice's clock, not UTC.
 
     Timestamps are stored in UTC, which is right; showing them in UTC is not.
-    A consultation at 21:45 in Leusden was appearing as 19:45.
+    A consultation at 21:45 in Leusden was appearing as 19:45. The date is on
+    the day divider above the card, so the card itself carries only the time.
     """
     from .util import local_time
 
-    value = row.get("started_at") or row.get("created_at") or ""
-    return local_time(value)[:16]
+    return local_time(_started(row), with_date=False)[:5]
+
+
+def _by_day(rows: list[dict[str, Any]]) -> list[tuple[str, list[dict[str, Any]]]]:
+    """Group an already newest-first list into (label, rows) per practice day.
+
+    A row whose timestamp cannot be parsed keeps its place in the list under
+    the divider of the row before it rather than vanishing; a doctor must never
+    see fewer recordings than the recorder sent.
+    """
+    from .util import dutch_date, local_datetime
+
+    groups: list[tuple[str, list[dict[str, Any]]]] = []
+    current = object()
+    for row in rows:
+        local = local_datetime(_started(row))
+        key = local.date() if local else current
+        if key != current or not groups:
+            current = key
+            label = dutch_date(local) if local else "Datum onbekend"
+            groups.append((label, []))
+        groups[-1][1].append(row)
+    return groups
 
 
 def render_recording(d: dict[str, Any], who: str) -> str:

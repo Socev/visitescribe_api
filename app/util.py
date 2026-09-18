@@ -146,10 +146,48 @@ def display_zone():
         return timezone.utc
 
 
+def local_datetime(value: str | None) -> datetime | None:
+    """An ISO-8601 UTC timestamp as an aware datetime on the practice's clock."""
+    parsed = parse_iso(value)
+    return None if parsed is None else parsed.astimezone(display_zone())
+
+
 def local_time(value: str | None, *, with_date: bool = True) -> str:
     """An ISO-8601 UTC timestamp as the practice's own wall clock."""
-    parsed = parse_iso(value)
-    if parsed is None:
+    local = local_datetime(value)
+    if local is None:
         return "" if value is None else str(value)
-    local = parsed.astimezone(display_zone())
     return local.strftime("%Y-%m-%d %H:%M:%S" if with_date else "%H:%M:%S")
+
+
+_NL_DAYS = ("maandag", "dinsdag", "woensdag", "donderdag", "vrijdag", "zaterdag", "zondag")
+_NL_MONTHS = ("januari", "februari", "maart", "april", "mei", "juni", "juli",
+              "augustus", "september", "oktober", "november", "december")
+
+
+def dutch_date(day, *, today=None) -> str:
+    """'Vandaag · vrijdag 18 september', 'Gisteren · …', or 'Vrijdag 18 september'.
+
+    Written out rather than taken from the C locale: the pod's locale is
+    whatever the base image ships, and a doctor should not see 'Friday'
+    because of it. The year is added only when it is not the current one.
+    """
+    from datetime import date as _date
+
+    if hasattr(day, "date"):
+        day = day.date()
+    if today is None:
+        # 'Today' on the practice's clock. At 00:30 in Leusden the pod's own
+        # date is still yesterday, and the divider would say so.
+        today = datetime.now(display_zone()).date()
+    elif not isinstance(today, _date) or hasattr(today, "hour"):
+        today = today.date()
+    words = f"{_NL_DAYS[day.weekday()]} {day.day} {_NL_MONTHS[day.month - 1]}"
+    if day.year != today.year:
+        words += f" {day.year}"
+    delta = (today - day).days
+    if delta == 0:
+        return f"Vandaag · {words}"
+    if delta == 1:
+        return f"Gisteren · {words}"
+    return words[0].upper() + words[1:]

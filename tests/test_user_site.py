@@ -780,3 +780,70 @@ def test_the_status_endpoints_survive_a_purged_session(site, fake_ourmind, serve
     assert site.get("/api/stand").status_code == 200
     assert server.admin.get(
         f"/admin/api/sessions/{rec.session_id}/stand").status_code == 200
+
+
+# ---------------------------------------------------------------------------
+# The recordings page is divided per practice day
+# ---------------------------------------------------------------------------
+
+def test_dutch_date_labels():
+    from datetime import date
+
+    from app.util import dutch_date
+
+    today = date(2026, 9, 18)
+    assert dutch_date(date(2026, 9, 18), today=today) == "Vandaag · vrijdag 18 september"
+    assert dutch_date(date(2026, 9, 17), today=today) == "Gisteren · donderdag 17 september"
+    assert dutch_date(date(2026, 9, 14), today=today) == "Maandag 14 september"
+    assert dutch_date(date(2025, 12, 31), today=today) == "Woensdag 31 december 2025"
+
+
+def test_recordings_are_grouped_per_practice_day(site, fake_ourmind, server, monkeypatch):
+    """The divider is the day in Leusden, not the UTC date the row was stored with."""
+    import re
+
+    from app import users
+
+    monkeypatch.setenv("VS_DISPLAY_TZ", "Europe/Amsterdam")
+    me = users.create("dokter@praktijk.nl")
+    server.register_device("visitescribe-001")
+    users.bind_device("visitescribe-001", me["user_id"])
+
+    # 22:30 UTC on Friday is 00:30 on Saturday in Leusden: a late house call
+    # belongs to the night it happened, not to the UTC calendar.
+    starts = {
+        "late": "2026-09-18T22:30:00Z",
+        "friday": "2026-09-18T08:00:00Z",
+        "thursday": "2026-09-17T15:00:00Z",
+    }
+    ids = {}
+    for name, started in starts.items():
+        rec = Recorder(server, device_id="visitescribe-001")
+        rec.add_chunk(seconds=0.5)
+        manifest = rec.manifest()
+        manifest["started_at"] = started
+        assert rec.create(manifest=manifest).status_code == 201
+        rec.upload_all(); rec.complete()
+        ids[name] = rec.session_id
+
+    _sign_in(site)
+    page = site.get("/").text
+
+    dividers = re.findall(r'<h2 class="day">([^<]+)</h2>', page)
+    assert [d.split(" · ")[-1].lower() for d in dividers] == [
+        "zaterdag 19 september", "vrijdag 18 september", "donderdag 17 september",
+    ]
+    # every recording is still there, each under its own day
+    for name, sid in ids.items():
+        assert sid in page, name
+    late_pos = page.index(ids["late"])
+    friday_pos = page.index(ids["friday"])
+    thursday_pos = page.index(ids["thursday"])
+    sat_div = page.index("aterdag 19 september")
+    fri_div = page.index("rijdag 18 september")
+    thu_div = page.index("onderdag 17 september")
+    assert sat_div < late_pos < fri_div < friday_pos < thu_div < thursday_pos
+    # the card shows the practice time, and the date only once, on the divider
+    late_card = page[late_pos - 400:late_pos]
+    assert "00:30" in late_card
+    assert "2026-09-18" not in page
