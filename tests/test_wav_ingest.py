@@ -58,19 +58,6 @@ def make_wav(seconds: float = 1.0, sample_rate: int = 16000, channels: int = 1,
     payload = b"WAVE" + chunks
     return b"RIFF" + struct.pack("<I", len(payload)) + payload
 
-def make_ulaw_wav(seconds: float = 1.0, sample_rate: int = 12000,
-                  channels: int = 1, seed: int = 0) -> bytes:
-    """G.711 mu-law WAV as emitted by the fast demo sync path."""
-    import numpy as np
-
-    frames = int(round(seconds * sample_rate))
-    t = np.linspace(0, seconds, frames, endpoint=False)
-    tone = 0.25 * np.sin(2 * np.pi * 440 * t)
-    data = tone if channels == 1 else np.column_stack([tone] * channels)
-    out = io.BytesIO()
-    sf.write(out, data, sample_rate, format="WAV", subtype="ULAW")
-    return out.getvalue()
-
 
 def chunk_info(server, session_id: str, sequence: int) -> dict:
     row = server.db.query_one(
@@ -101,20 +88,6 @@ def test_canonical_wav_parses_to_the_right_duration():
     assert info.bits_per_sample == 16
     assert info.total_samples == 30 * 16000
     assert info.duration_ms == 30_000
-    assert info.deep_verified is True
-    assert info.decoder == "libsndfile-wav"
-
-
-def test_mulaw_wav_parses_and_deep_decodes():
-    from app import flacinfo
-
-    info = flacinfo.validate(make_ulaw_wav(seconds=2.0, sample_rate=12000, channels=1))
-    assert info.valid is True
-    assert info.sample_rate == 12000
-    assert info.channels == 1
-    assert info.bits_per_sample == 8
-    assert info.total_samples == 24000
-    assert info.duration_ms == 2000
     assert info.deep_verified is True
     assert info.decoder == "libsndfile-wav"
 
@@ -151,7 +124,7 @@ def test_metadata_chunk_between_fmt_and_data_is_tolerated():
 
 @pytest.mark.parametrize("mangle, expected", [
     # a compressed WAV is not lossless and the pipeline must not take it
-    (lambda w: w[:20] + struct.pack("<H", 2) + w[22:], "not supported"),
+    (lambda w: w[:20] + struct.pack("<H", 2) + w[22:], "not PCM"),
     # header fields that disagree with each other
     (lambda w: w[:32] + struct.pack("<H", 99) + w[34:], "block_align"),
     (lambda w: w[:28] + struct.pack("<I", 12345) + w[32:], "byte_rate"),
@@ -182,7 +155,7 @@ def test_unaligned_data_size_is_refused():
 def test_a_payload_that_is_neither_container_is_refused():
     from app import flacinfo
 
-    with pytest.raises(flacinfo.FlacError, match="neither FLAC nor supported WAV"):
+    with pytest.raises(flacinfo.FlacError, match="neither FLAC nor PCM WAV"):
         flacinfo.validate(b"OggS" + b"\x00" * 200)
     with pytest.raises(flacinfo.FlacError):
         flacinfo.validate(b"")
