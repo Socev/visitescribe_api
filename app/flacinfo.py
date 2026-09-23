@@ -195,12 +195,7 @@ def parse_structure(data: bytes) -> FlacInfo:
 
 def parse_wav_structure(data: bytes,
                         max_decoded_bytes: int = MAX_DECODED_BYTES) -> FlacInfo:
-    """Validate RIFF/WAVE PCM without relying on a decoder.
-
-    The CoreS3 currently emits PCM16 canonical WAV chunks, but the parser walks
-    RIFF chunks instead of assuming a fixed 44-byte header so harmless metadata
-    chunks remain forward compatible.
-    """
+    """Validate supported RIFF/WAVE audio without relying on a decoder.\n\n    Recorder sync accepts canonical PCM WAV and G.711 mu-law WAV. The parser\n    walks RIFF chunks instead of assuming a fixed 44-byte header so harmless\n    metadata chunks remain forward compatible.\n    """
     if len(data) < 44 or data[:4] != WAV_RIFF or data[8:12] != WAV_WAVE:
         raise FlacError("missing RIFF/WAVE header")
     declared_riff = int.from_bytes(data[4:8], "little") + 8
@@ -208,7 +203,7 @@ def parse_wav_structure(data: bytes,
         raise FlacError("RIFF length runs past end of stream")
 
     pos = 12
-    fmt: tuple[int, int, int, int, int] | None = None
+    fmt: tuple[int, int, int, int, int, int] | None = None
     data_size: int | None = None
     while pos + 8 <= len(data):
         chunk_id = data[pos:pos + 4]
@@ -226,22 +221,29 @@ def parse_wav_structure(data: bytes,
             byte_rate = int.from_bytes(data[body + 8:body + 12], "little")
             block_align = int.from_bytes(data[body + 12:body + 14], "little")
             bits = int.from_bytes(data[body + 14:body + 16], "little")
-            # 1 = integer PCM.  The recorder deliberately uses this simplest,
-            # most interoperable form rather than WAVE_FORMAT_EXTENSIBLE.
-            if audio_format != 1:
-                raise FlacError(f"WAV format {audio_format} is not PCM")
+            # 1 = integer PCM, 7 = ITU G.711 mu-law.  Mu-law is used by the
+            # demo sync path because it halves bytes again versus PCM16 while
+            # remaining trivial to encode on the recorder and natively
+            # decodable by libsndfile.
+            if audio_format not in (1, 7):
+                raise FlacError(f"WAV format {audio_format} is not supported")
             if not 1 <= channels <= 8:
                 raise FlacError(f"WAV declares {channels} channels")
             if sample_rate <= 0:
                 raise FlacError("WAV sample rate is invalid")
-            if bits not in (8, 16, 24, 32):
-                raise FlacError(f"WAV declares unsupported {bits}-bit samples")
-            expected_align = channels * ((bits + 7) // 8)
+            if audio_format == 1:
+                if bits not in (8, 16, 24, 32):
+                    raise FlacError(f"WAV declares unsupported {bits}-bit PCM samples")
+                expected_align = channels * ((bits + 7) // 8)
+            else:
+                if bits != 8:
+                    raise FlacError("mu-law WAV must declare 8 bits per sample")
+                expected_align = channels
             if block_align != expected_align:
                 raise FlacError("WAV block_align is inconsistent")
             if byte_rate != sample_rate * block_align:
                 raise FlacError("WAV byte_rate is inconsistent")
-            fmt = (channels, sample_rate, bits, block_align, byte_rate)
+            fmt = (audio_format, channels, sample_rate, bits, block_align, byte_rate)
         elif chunk_id == b"data":
             data_size = size
             break
@@ -251,7 +253,7 @@ def parse_wav_structure(data: bytes,
         raise FlacError("WAV has no fmt chunk")
     if data_size is None:
         raise FlacError("WAV has no data chunk")
-    channels, sample_rate, bits, block_align, _ = fmt
+    audio_format, channels, sample_rate, bits, block_align, _ = fmt
     if data_size % block_align:
         raise FlacError("WAV data size is not frame aligned")
     total = data_size // block_align
@@ -277,7 +279,7 @@ def parse_wav_structure(data: bytes,
         bits_per_sample=bits,
         total_samples=total,
         duration_ms=int(round(total * 1000 / sample_rate)),
-        decoder="structural-wav",
+        decoder="structural-wav-ulaw" if audio_format == 7 else "structural-wav",
     )
     if total == 0:
         result.warnings.append("WAV data chunk is empty")
@@ -417,7 +419,7 @@ def container(data: bytes) -> str | None:
 
 def validate(data: bytes, deep: bool = True,
              max_decoded_bytes: int = MAX_DECODED_BYTES) -> FlacInfo:
-    """Validate an authenticated FLAC or PCM WAV recorder chunk."""
+    """Validate an authenticated FLAC or supported WAV recorder chunk."""
     if data[:4] == FLAC_MAGIC:
         info = parse_structure(data)
         if deep:
@@ -428,7 +430,7 @@ def validate(data: bytes, deep: bool = True,
         if deep:
             info = deep_verify_wav(data, info, max_decoded_bytes=max_decoded_bytes)
         return info
-    raise FlacError("payload is neither FLAC nor PCM WAV")
+    raise FlacError("payload is neither FLAC nor supported WAV")
 
 
 def check_against_manifest(info: FlacInfo, audio: dict[str, Any]) -> list[str]:
@@ -446,7 +448,7 @@ def check_against_manifest(info: FlacInfo, audio: dict[str, Any]) -> list[str]:
         )
     fmt = audio.get("sample_format")
     if isinstance(fmt, str) and fmt:
-        expected = {"S16_LE": 16, "S24_LE": 24, "S32_LE": 32, "S8": 8, "U8": 8}.get(fmt.upper())
+        expected = {"S16_LE": 16, "S24_LE": 24, "S32_LE": 32, "S8": 8, "U8": 8, "ULAW": 8}.get(fmt.upper())
         if expected and expected != info.bits_per_sample:
             problems.append(
                 f"manifest declares {fmt} but the audio is {info.bits_per_sample}-bit"
