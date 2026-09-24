@@ -155,7 +155,10 @@ def test_unaligned_data_size_is_refused():
 def test_a_payload_that_is_neither_container_is_refused():
     from app import flacinfo
 
-    with pytest.raises(flacinfo.FlacError, match="neither FLAC nor PCM WAV"):
+    with pytest.raises(flacinfo.FlacError, match="neither FLAC, PCM WAV nor Ogg/Opus"):
+        flacinfo.validate(b"ID3\x04" + b"\x00" * 200)
+    # Ogg is recognised since 1.6.0, but garbage behind the magic is not audio.
+    with pytest.raises(flacinfo.FlacError, match="Ogg"):
         flacinfo.validate(b"OggS" + b"\x00" * 200)
     with pytest.raises(flacinfo.FlacError):
         flacinfo.validate(b"")

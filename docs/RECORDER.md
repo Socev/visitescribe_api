@@ -105,3 +105,93 @@ python tools/simulate_recorder.py \
 ```
 
 Exits `0` only if every call succeeded and the session ended confirmed.
+
+## Compact uploads: Ogg/Opus sessions (since 1.6.0)
+
+The recorder keeps its lossless 48 kHz stereo master on the SD card. The copy
+that goes over the wire only has to be good speech, so a session may be
+declared `codec: "opus"` and carry Ogg/Opus chunks: ~24 kbit/s instead of
+256 kbit/s for PCM16 mono, roughly 90 kB per 30 s chunk instead of 960 kB.
+
+**The codec is bound to the session.** A manifest with `codec: "opus"` takes
+only Ogg/Opus chunks. Every other manifest -- every recorder in the field --
+takes only FLAC or integer-PCM WAV, exactly as before. A session keeps the
+format it was created with: re-posting its manifest with a different `audio`
+block is an `IDEMPOTENCY_CONFLICT`, so a session that already exists on the
+server is finished in its original format.
+
+### Manifest
+
+```json
+"audio": {
+  "codec": "opus",
+  "container": "ogg",
+  "sample_rate": 16000,
+  "channels": 1,
+  "sample_format": "opus",
+  "chunk_seconds": 30,
+  "bitrate": 24000,
+  "frame_ms": 20
+}
+```
+
+`sample_rate` is the **encoder input rate**, which is also OpusHead's
+`input_sample_rate` and the rate the server decodes at. It is *not* the 48 kHz
+granule clock that Ogg/Opus always uses internally; the server does that
+conversion. `container`, `bitrate` and `frame_ms` are informational (bitrate and
+frame length are not checked); `codec`, `sample_rate`, `channels` and
+`sample_format` are checked at `POST /v1/sessions` (`INVALID_MANIFEST`) and
+again against every chunk (`INVALID_FLAC`).
+
+### Each chunk
+
+One complete, self-contained Ogg/Opus file (RFC 7845), decodable on its own:
+
+| | |
+|---|---|
+| content | 16 kHz mono speech, at most 30 s, a whole number of 16 kHz samples |
+| encoder | libopus, 24 kbit/s VBR, 20 ms frames, application VOIP, DTX off, in-band FEC off |
+| OpusHead | alone on the first page (BOS), channels 1, `input_sample_rate` 16000, mapping family 0, output gain 0, pre-skip as the encoder reports it |
+| OpusTags | starts on the second page; its last page holds nothing else |
+| stream | one logical stream (one serial number), page sequence 0, 1, 2 … without gaps, valid CRCs, EOS on the last page only, no bytes after it |
+| granule | 48 kHz clock; every audio page's granule equals the samples carried so far; the last page's granule is `pre_skip + 3 × (16 kHz samples)` -- the end-trim |
+| file name | `audio/chunk-000001.opus.enc` (informational) |
+| MIME before encryption | `audio/ogg; codecs=opus` |
+
+The server checks all of this, then decodes the whole chunk with libsndfile and
+requires the decoded sample count to equal what the granules declare. That
+makes each chunk's duration exact, and with it every patient boundary.
+
+Reference encoder (the PC sync app), one invocation per chunk, on the 16 kHz
+mono PCM of exactly that chunk:
+
+```
+ffmpeg -i chunk.wav -ac 1 -ar 16000 \
+       -c:a libopus -b:a 24k -vbr on -compression_level 10 \
+       -application voip -frame_duration 20 \
+       -map_metadata -1 -fflags +bitexact -flags:a +bitexact \
+       -f ogg chunk-000001.opus
+```
+
+`+bitexact` matters: without it ffmpeg picks a random Ogg serial, so a
+re-encode yields different bytes than the hash the manifest already pinned.
+Encode and encrypt each chunk **once**, keep the encrypted file until the
+session is confirmed, and re-send those same bytes on every retry.
+
+### Encryption
+
+Unchanged. The server takes the nonce and the AAD from the request headers and
+imposes no structure on either; it only requires a nonce not to repeat within
+a session. For Opus sessions use a separate derivation domain so an Opus
+plaintext can never be encrypted under a nonce a PCM plaintext already used:
+
+```
+nonce = HMAC-SHA256(<nonce key>, "nonce:v4-opus:<session uuid>:<sequence>")[:12]
+AAD   = "visitescribe-v4-opus:<session uuid>:<sequence>"     (ASCII)
+```
+
+### Downstream
+
+Each chunk is decoded independently to 16 kHz PCM. Reassembly, patient slicing
+and export work on that PCM exactly as for FLAC/WAV sessions; Mistral receives
+FLAC decoded from the Opus, so there is one lossy generation, not two.

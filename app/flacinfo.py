@@ -1,8 +1,13 @@
-"""Lossless recorder-audio container validation.
+"""Recorder-audio container validation.
 
 The original recorder uploads FLAC chunks; the CoreS3-Lite records canonical
-PCM WAV locally and uploads independently valid WAV chunks.  Both are lossless
-and both are fully authenticated by AES-GCM before this module sees them.
+PCM WAV locally and uploads independently valid WAV chunks.  Both are lossless.
+Since 1.6.0 a session may instead be declared ``codec: "opus"`` and carry
+self-contained Ogg/Opus chunks (the PC sync app, and later the recorder
+itself): the lossless 48 kHz master stays on the recorder's card, and the
+upload copy only has to be good speech.  Lossy audio is accepted *only* in a
+session whose manifest says so -- see ``check_against_manifest``.  Every chunk
+is fully authenticated by AES-GCM before this module sees it.
 
 Validation has two layers:
 
@@ -35,6 +40,14 @@ except Exception:  # noqa: BLE001
 FLAC_MAGIC = b"fLaC"
 WAV_RIFF = b"RIFF"
 WAV_WAVE = b"WAVE"
+OGG_MAGIC = b"OggS"
+
+# Opus always counts granule positions at 48 kHz, whatever the encoder was fed.
+OPUS_GRANULE_RATE = 48000
+# The rates an Opus decoder can produce natively.  OpusHead's input_sample_rate
+# must be one of them: libsndfile then decodes at exactly that rate, so the
+# sample rate the manifest declares is the rate the pipeline sees downstream.
+OPUS_DECODE_RATES = (8000, 12000, 16000, 24000, 48000)
 
 # A FLAC stream of digital silence compresses enormously: a few hundred KiB of
 # ciphertext can declare hours of audio, and decoding it would allocate
@@ -74,6 +87,7 @@ class FlacInfo:
     md5: str = ""
     md5_verified: bool | None = None
     decoder: str = ""
+    codec: str = ""
     warnings: list[str] = field(default_factory=list)
 
     def to_dict(self) -> dict[str, Any]:
@@ -88,6 +102,7 @@ class FlacInfo:
             "md5": self.md5,
             "md5_verified": self.md5_verified,
             "decoder": self.decoder,
+            "codec": self.codec,
             "warnings": self.warnings,
         }
 
@@ -187,6 +202,7 @@ def parse_structure(data: bytes) -> FlacInfo:
         max_block_size=int(info["max_block_size"]),
         md5=str(info["md5"]),
         decoder="structural-flac",
+        codec="flac",
     )
     if total == 0:
         result.warnings.append("STREAMINFO declares 0 total samples (streamed encode)")
@@ -278,6 +294,7 @@ def parse_wav_structure(data: bytes,
         total_samples=total,
         duration_ms=int(round(total * 1000 / sample_rate)),
         decoder="structural-wav",
+        codec="pcm",
     )
     if total == 0:
         result.warnings.append("WAV data chunk is empty")
@@ -401,6 +418,278 @@ def deep_verify_wav(data: bytes, info: FlacInfo,
     return info
 
 
+# ---------------------------------------------------------------------------
+# Ogg/Opus (RFC 7845)
+# ---------------------------------------------------------------------------
+
+def _make_ogg_crc_table() -> list[int]:
+    table = []
+    for i in range(256):
+        r = i << 24
+        for _ in range(8):
+            r = ((r << 1) ^ 0x04C11DB7) if r & 0x80000000 else (r << 1)
+        table.append(r & 0xFFFFFFFF)
+    return table
+
+
+_OGG_CRC_TABLE = _make_ogg_crc_table()
+
+
+def _ogg_crc(page: bytes) -> int:
+    """Ogg's CRC-32: polynomial 0x04C11DB7, zero init, no reflection."""
+    crc = 0
+    table = _OGG_CRC_TABLE
+    for byte in page:
+        crc = ((crc << 8) & 0xFFFFFFFF) ^ table[((crc >> 24) ^ byte) & 0xFF]
+    return crc
+
+
+def _opus_packet_samples(packet: bytes) -> int:
+    """Samples (at 48 kHz) in one Opus packet, from its TOC byte (RFC 6716 3.1)."""
+    if not packet:
+        raise FlacError("empty Opus packet in the audio stream")
+    toc = packet[0]
+    config = toc >> 3
+    if config < 12:          # SILK-only: 10, 20, 40, 60 ms
+        frame = (480, 960, 1920, 2880)[config & 3]
+    elif config < 16:        # hybrid: 10, 20 ms
+        frame = (480, 960)[config & 1]
+    else:                    # CELT-only: 2.5, 5, 10, 20 ms
+        frame = (120, 240, 480, 960)[config & 3]
+    code = toc & 3
+    if code == 0:
+        count = 1
+    elif code in (1, 2):
+        count = 2
+    else:
+        if len(packet) < 2:
+            raise FlacError("Opus code-3 packet has no frame count byte")
+        count = packet[1] & 0x3F
+        if count == 0:
+            raise FlacError("Opus code-3 packet declares zero frames")
+    samples = frame * count
+    if samples > 5760:  # 120 ms is the most one packet may hold
+        raise FlacError("Opus packet holds more than 120 ms of audio")
+    return samples
+
+
+def parse_ogg_opus_structure(data: bytes,
+                             max_decoded_bytes: int = MAX_DECODED_BYTES) -> FlacInfo:
+    """Validate one self-contained Ogg/Opus chunk without a decoder.
+
+    The contract (docs/RECORDER.md) is a complete, single-stream Ogg/Opus file
+    per chunk: BOS page with OpusHead alone, OpusTags, audio, EOS on the last
+    page.  Every page CRC is checked, page sequence numbers must be contiguous,
+    and granule positions must count exactly the samples the packets carry --
+    the last page may trim the tail (RFC 7845 end trimming) and nothing else.
+    That is what makes each chunk's duration exact, and with it every offset
+    the patient segmentation computes.
+    """
+    if len(data) < 27 or data[:4] != OGG_MAGIC:
+        raise FlacError("missing OggS capture pattern")
+
+    pos = 0
+    page_index = 0
+    serial: int | None = None
+    pending = b""                 # packet bytes carried over into the next page
+    packets: list[tuple[bytes, int]] = []   # (packet, index of page it ends on)
+    pages: list[dict[str, int]] = []
+    while pos < len(data):
+        if len(data) - pos < 27:
+            raise FlacError("trailing bytes after the last Ogg page")
+        if data[pos:pos + 4] != OGG_MAGIC:
+            raise FlacError(f"Ogg page {page_index} has no capture pattern")
+        if data[pos + 4] != 0:
+            raise FlacError(f"Ogg page {page_index} has stream structure version "
+                            f"{data[pos + 4]}")
+        flags = data[pos + 5]
+        granule = int.from_bytes(data[pos + 6:pos + 14], "little", signed=True)
+        page_serial = int.from_bytes(data[pos + 14:pos + 18], "little")
+        sequence = int.from_bytes(data[pos + 18:pos + 22], "little")
+        crc = int.from_bytes(data[pos + 22:pos + 26], "little")
+        segments = data[pos + 26]
+        lacing_end = pos + 27 + segments
+        if lacing_end > len(data):
+            raise FlacError(f"Ogg page {page_index} header runs past end of stream")
+        lacing = data[pos + 27:lacing_end]
+        end = lacing_end + sum(lacing)
+        if end > len(data):
+            raise FlacError(f"Ogg page {page_index} runs past end of stream")
+        page = data[pos:end]
+        if _ogg_crc(page[:22] + b"\x00\x00\x00\x00" + page[26:]) != crc:
+            raise FlacError(f"Ogg page {page_index} fails its CRC")
+
+        if serial is None:
+            serial = page_serial
+        elif page_serial != serial:
+            raise FlacError("chunk contains more than one logical Ogg stream")
+        if sequence != page_index:
+            raise FlacError(f"Ogg page sequence jumps to {sequence} at page {page_index}")
+        if bool(flags & 0x02) != (page_index == 0):
+            raise FlacError("only the first Ogg page may, and must, carry BOS")
+        if bool(flags & 0x01) != bool(pending):
+            raise FlacError(f"Ogg page {page_index} continuation flag is inconsistent")
+
+        body = lacing_end
+        completed = 0
+        for value in lacing:
+            pending += data[body:body + value]
+            body += value
+            if value < 255:
+                packets.append((pending, page_index))
+                pending = b""
+                completed += 1
+        pages.append({"granule": granule, "completed": completed,
+                      "eos": int(bool(flags & 0x04)), "packets_end": len(packets),
+                      "open": int(bool(pending))})
+        pos = end
+        page_index += 1
+
+    if pending:
+        raise FlacError("the last Ogg page ends inside a packet")
+    if not pages[-1]["eos"] or any(p["eos"] for p in pages[:-1]):
+        raise FlacError("only the last Ogg page may, and must, carry EOS")
+
+    # --- OpusHead: alone on page 0 ------------------------------------------
+    if pages[0]["completed"] != 1 or pages[0]["open"] or packets[0][1] != 0:
+        raise FlacError("the first Ogg page must hold exactly the OpusHead packet")
+    head = packets[0][0]
+    if len(head) < 19 or head[:8] != b"OpusHead":
+        raise FlacError("first packet is not OpusHead")
+    if head[8] >> 4:
+        raise FlacError(f"unsupported OpusHead version {head[8]}")
+    channels = head[9]
+    pre_skip = int.from_bytes(head[10:12], "little")
+    input_rate = int.from_bytes(head[12:16], "little")
+    gain = int.from_bytes(head[16:18], "little", signed=True)
+    family = head[18]
+    if family != 0:
+        raise FlacError(f"channel mapping family {family} is not supported; use 0")
+    if channels not in (1, 2):
+        raise FlacError(f"OpusHead declares {channels} channels")
+    if input_rate not in OPUS_DECODE_RATES:
+        raise FlacError(
+            f"OpusHead input_sample_rate {input_rate} is not one of "
+            f"{', '.join(map(str, OPUS_DECODE_RATES))}"
+        )
+    if pages[0]["granule"] != 0:
+        raise FlacError("the OpusHead page must have granule position 0")
+
+    # --- OpusTags: starts on page 1, and its last page holds nothing else ----
+    if len(packets) < 2 or packets[1][0][:8] != b"OpusTags":
+        raise FlacError("second packet is not OpusTags")
+    tags_page = packets[1][1]
+    if pages[tags_page]["packets_end"] != 2 or pages[tags_page]["open"]:
+        raise FlacError("audio shares a page with OpusTags")
+    for index in range(1, tags_page + 1):
+        if pages[index]["granule"] not in (0, -1) or (
+            pages[index]["completed"] and pages[index]["granule"] != 0
+        ):
+            raise FlacError("the OpusTags pages must have granule position 0")
+
+    # --- audio: granule positions count exactly what the packets carry -------
+    audio = packets[2:]
+    if not audio:
+        raise FlacError("Ogg/Opus stream has no audio packets")
+    counted = 0
+    audio_index = 0
+    last_page = len(pages) - 1
+    for index in range(tags_page + 1, len(pages)):
+        page = pages[index]
+        before = counted
+        while audio_index < len(audio) and audio[audio_index][1] == index:
+            counted += _opus_packet_samples(audio[audio_index][0])
+            audio_index += 1
+        if not page["completed"]:
+            if page["granule"] != -1:
+                raise FlacError(f"Ogg page {index} completes no packet but has a granule")
+            continue
+        if index == last_page:
+            # End trimming may only drop samples of the final page.
+            if not before <= page["granule"] <= counted:
+                raise FlacError(
+                    f"final granule position {page['granule']} is outside the "
+                    f"last page's audio ({before}..{counted})"
+                )
+        elif page["granule"] != counted:
+            raise FlacError(
+                f"Ogg page {index} granule position {page['granule']} does not "
+                f"match the {counted} samples its packets carry"
+            )
+
+    final = pages[-1]["granule"]
+    if final < pre_skip:
+        raise FlacError("final granule position is smaller than the pre-skip")
+    at_48k = final - pre_skip
+    if (at_48k * input_rate) % OPUS_GRANULE_RATE:
+        raise FlacError(
+            f"stream length {at_48k} (48 kHz) is not a whole number of "
+            f"{input_rate} Hz samples"
+        )
+    total = at_48k * input_rate // OPUS_GRANULE_RATE
+    declared = total * channels * 4
+    if declared > max_decoded_bytes:
+        raise FlacError(
+            f"stream declares {declared} decoded bytes, above the "
+            f"{max_decoded_bytes} limit"
+        )
+    result = FlacInfo(
+        valid=True,
+        sample_rate=input_rate,
+        channels=channels,
+        bits_per_sample=0,     # Opus has no stored sample width
+        total_samples=total,
+        duration_ms=int(round(total * 1000 / input_rate)),
+        decoder="structural-ogg-opus",
+        codec="opus",
+    )
+    if gain:
+        result.warnings.append(f"OpusHead output gain is {gain} (Q7.8 dB), not 0")
+    if total == 0:
+        result.warnings.append("Ogg/Opus stream contains no audio after pre-skip")
+    return result
+
+
+def deep_verify_ogg_opus(data: bytes, info: FlacInfo,
+                         max_decoded_bytes: int = MAX_DECODED_BYTES) -> FlacInfo:
+    """Decode Ogg/Opus in bounded blocks; the sample count must match exactly."""
+    if _soundfile is None or _numpy is None:
+        info.warnings.append("libsndfile or numpy unavailable; structural validation only")
+        return info
+    frames = 0
+    bytes_per_frame = max(info.channels, 1) * 4
+    try:
+        with _soundfile.SoundFile(io.BytesIO(data)) as handle:
+            if handle.format != "OGG" or handle.subtype != "OPUS":
+                raise FlacError(
+                    f"libsndfile reports {handle.format}/{handle.subtype}, not OGG/OPUS"
+                )
+            if handle.samplerate != info.sample_rate:
+                raise FlacError(
+                    f"libsndfile decodes at {handle.samplerate} Hz, but OpusHead "
+                    f"declares {info.sample_rate}"
+                )
+            if handle.channels != info.channels:
+                raise FlacError("decoded channel count disagrees with OpusHead")
+            for block in handle.blocks(blocksize=DECODE_BLOCK_FRAMES, dtype="int32",
+                                       always_2d=True):
+                frames += int(block.shape[0])
+                if frames * bytes_per_frame > max_decoded_bytes:
+                    raise FlacError(f"stream decoded past the {max_decoded_bytes} byte limit")
+    except FlacError:
+        raise
+    except Exception as exc:  # noqa: BLE001
+        raise FlacError(f"stream is not decodable: {exc}") from exc
+    if frames != info.total_samples:
+        raise FlacError(
+            f"decoded {frames} frames but the granule positions declare "
+            f"{info.total_samples}"
+        )
+    info.deep_verified = True
+    info.decoder = "libsndfile-ogg-opus"
+    return info
+
+
 def container(data: bytes) -> str | None:
     """Which accepted container these bytes are, from the magic alone.
 
@@ -412,12 +701,18 @@ def container(data: bytes) -> str | None:
         return "flac"
     if data[:4] == WAV_RIFF and len(data) >= 12 and data[8:12] == WAV_WAVE:
         return "wav"
+    if data[:4] == OGG_MAGIC:
+        return "ogg"
     return None
 
 
 def validate(data: bytes, deep: bool = True,
              max_decoded_bytes: int = MAX_DECODED_BYTES) -> FlacInfo:
-    """Validate an authenticated FLAC or PCM WAV recorder chunk."""
+    """Validate an authenticated FLAC, PCM WAV or Ogg/Opus recorder chunk.
+
+    Which of these a *session* may carry is decided afterwards, against its
+    manifest, by ``check_against_manifest``.
+    """
     if data[:4] == FLAC_MAGIC:
         info = parse_structure(data)
         if deep:
@@ -428,12 +723,37 @@ def validate(data: bytes, deep: bool = True,
         if deep:
             info = deep_verify_wav(data, info, max_decoded_bytes=max_decoded_bytes)
         return info
-    raise FlacError("payload is neither FLAC nor PCM WAV")
+    if data[:4] == OGG_MAGIC:
+        info = parse_ogg_opus_structure(data, max_decoded_bytes=max_decoded_bytes)
+        if deep:
+            info = deep_verify_ogg_opus(data, info, max_decoded_bytes=max_decoded_bytes)
+        return info
+    raise FlacError("payload is neither FLAC, PCM WAV nor Ogg/Opus")
 
 
 def check_against_manifest(info: FlacInfo, audio: dict[str, Any]) -> list[str]:
-    """Return human-readable conflicts between the manifest and the audio."""
+    """Return human-readable conflicts between the manifest and the audio.
+
+    The codec is bound to the session: a session declared ``codec: "opus"``
+    takes only Ogg/Opus chunks, and every other session -- every recorder that
+    existed before 1.6.0 -- takes only lossless FLAC/PCM WAV, exactly as it
+    always did.  A lossy chunk can therefore never slip into a session whose
+    manifest promised lossless audio.
+    """
     problems: list[str] = []
+    declared_codec = str(audio.get("codec") or "").strip().lower()
+    actual_codec = info.codec or "flac"
+    if declared_codec == "opus":
+        if actual_codec != "opus":
+            problems.append(
+                f"manifest declares codec opus but the chunk is {actual_codec}"
+            )
+    elif actual_codec == "opus":
+        problems.append(
+            "the chunk is Ogg/Opus but the manifest declares codec "
+            f"{declared_codec or '(none)'}; lossy audio is only accepted in a "
+            'session declared as codec "opus"'
+        )
     declared_rate = audio.get("sample_rate")
     if isinstance(declared_rate, int) and declared_rate and declared_rate != info.sample_rate:
         problems.append(
@@ -445,7 +765,11 @@ def check_against_manifest(info: FlacInfo, audio: dict[str, Any]) -> list[str]:
             f"manifest declares {declared_channels} channels but the audio has {info.channels}"
         )
     fmt = audio.get("sample_format")
-    if isinstance(fmt, str) and fmt:
+    if actual_codec == "opus":
+        if isinstance(fmt, str) and fmt and fmt.strip().lower() != "opus":
+            problems.append(f'manifest declares sample_format {fmt}; an Opus '
+                            'session must declare "opus"')
+    elif isinstance(fmt, str) and fmt:
         expected = {"S16_LE": 16, "S24_LE": 24, "S32_LE": 32, "S8": 8, "U8": 8}.get(fmt.upper())
         if expected and expected != info.bits_per_sample:
             problems.append(
@@ -456,3 +780,30 @@ def check_against_manifest(info: FlacInfo, audio: dict[str, Any]) -> list[str]:
 
 def decoder_available() -> bool:
     return _soundfile is not None and _numpy is not None
+
+
+def manifest_audio_problems(audio: dict[str, Any]) -> list[str]:
+    """Problems with an Opus session's ``audio`` block, caught at POST /sessions.
+
+    Refusing a bad manifest up front beats accepting the session and refusing
+    every chunk of it later.  Sessions with any other codec are not touched:
+    their manifests are exactly as permissive as they were before 1.6.0.
+    """
+    if str(audio.get("codec") or "").strip().lower() != "opus":
+        return []
+    problems: list[str] = []
+    container_name = audio.get("container")
+    if container_name is not None and str(container_name).strip().lower() != "ogg":
+        problems.append('audio.container must be "ogg" for codec opus')
+    rate = audio.get("sample_rate")
+    if rate not in OPUS_DECODE_RATES:
+        problems.append(
+            "audio.sample_rate must be the encoder input rate, one of "
+            f"{', '.join(map(str, OPUS_DECODE_RATES))} (16000 for VisiteScribe)"
+        )
+    if audio.get("channels") not in (1, 2):
+        problems.append("audio.channels must be 1 or 2 for codec opus")
+    fmt = audio.get("sample_format")
+    if fmt is not None and str(fmt).strip().lower() != "opus":
+        problems.append('audio.sample_format must be "opus" for codec opus')
+    return problems

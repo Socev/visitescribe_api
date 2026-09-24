@@ -217,6 +217,11 @@ async def create_session(request: Request) -> Response:
                   detail={"reason": str(exc)})
         raise ApiError("INVALID_KEY_WRAP", str(exc)) from exc
 
+    audio_problems = flacinfo.manifest_audio_problems(
+        manifest.audio.model_dump(exclude_none=False))
+    if audio_problems:
+        raise ApiError("INVALID_MANIFEST", "; ".join(audio_problems))
+
     chunk_specs = _validate_manifest_chunks(manifest)
 
     # RSA-OAEP padding is randomised, so a client that re-wraps the same session
@@ -593,7 +598,10 @@ async def put_chunk(session_id: str, sequence: int, request: Request) -> Respons
             "Decrypted SHA-256 does not match X-Plaintext-SHA256",
         )
 
-    # --- 7. the plaintext must really be FLAC ------------------------------
+    # --- 7. the plaintext must really be audio the session declared ---------
+    # FLAC or PCM WAV for every legacy session, Ogg/Opus for a session whose
+    # manifest says codec "opus". The error code stays INVALID_FLAC whatever
+    # the container: recorders already in the field key on it.
     try:
         info = await asyncio.to_thread(
             flacinfo.validate, plaintext, settings.flac_deep_verify,
@@ -603,7 +611,7 @@ async def put_chunk(session_id: str, sequence: int, request: Request) -> Respons
         audit.log("integrity", "invalid_flac", "failure", device_id=ident.device_id,
                   session_id=session_id, sequence=sequence, source_ip=ident.source_ip,
                   idempotency_key=idem_key, detail={"reason": str(exc)})
-        raise ApiError("INVALID_FLAC", f"Decrypted payload is not valid FLAC: {exc}") from exc
+        raise ApiError("INVALID_FLAC", f"Decrypted payload is not valid audio: {exc}") from exc
 
     try:
         audio_spec = json.loads(session.get("audio_json") or "{}")
@@ -658,6 +666,7 @@ async def put_chunk(session_id: str, sequence: int, request: Request) -> Respons
                 "ciphertext_bytes": len(body),
                 "plaintext_bytes": len(plaintext),
                 "flac": {
+                    "codec": info.codec,
                     "sample_rate": info.sample_rate,
                     "channels": info.channels,
                     "bits_per_sample": info.bits_per_sample,
@@ -702,6 +711,7 @@ def _chunk_response(row: dict[str, Any], duplicate: bool = False) -> dict[str, A
         "flac_valid": bool(row.get("flac_valid")),
         "flac_deep_verified": bool(row.get("flac_deep_verified")),
         "duration_ms": info.get("duration_ms"),
+        "codec": info.get("codec"),
         "ciphertext_size": row.get("ciphertext_size"),
         "plaintext_size": row.get("plaintext_size"),
     }
