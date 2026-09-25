@@ -370,6 +370,36 @@ def maybe_autostart(session_id: str) -> dict[str, Any] | None:
         return None
 
 
+def recording_title(session: dict[str, Any], segment_index: int | None) -> str:
+    """What the recording is called at the provider.
+
+    "VISITE - Patiënt 1 - 24-09-26 - 07:31", "VERGADERING - 12-09-26 - 14:20":
+    the recording type, the patient within a round, and when it was recorded
+    -- on the practice's clock, and for a later patient the moment their part
+    of the round began, not the moment the recorder was switched on.
+    """
+    from datetime import timedelta
+
+    from .util import local_datetime
+
+    kind = users.type_title(session["mode"]).upper()
+    parts = [kind]
+    start_ms = 0
+    if segment_index is None and session["mode"] == "multi_patient":
+        parts.append("Patiënt 1")      # a round that turned out to hold one
+    elif segment_index is not None:
+        parts.append(f"Patiënt {segment_index}")
+        seg = next((s for s in sessions.patient_segments(session["session_id"])
+                    if s["index"] == segment_index), None)
+        if seg is not None:
+            start_ms = int(seg["start_ms"] or 0)
+    when = local_datetime(session.get("started_at") or session.get("created_at"))
+    if when is not None:
+        when = when + timedelta(milliseconds=start_ms)
+        parts.append(when.strftime("%d-%m-%y - %H:%M"))
+    return " - ".join(parts)
+
+
 def run_job(job: dict[str, Any]) -> None:
     session = sessions.get(job["session_id"])
     if session is None:
@@ -405,6 +435,7 @@ def run_job(job: dict[str, Any]) -> None:
 
     segment_index = job["segment_index"]
     context = {
+        "title": recording_title(session, segment_index),
         "mode": session["mode"],
         "client_status": session["client_status"],
         "segment_index": segment_index,

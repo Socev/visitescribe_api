@@ -61,7 +61,13 @@ class OurMindProvider:
             f.strip() for f in (os.environ.get("VS_OURMIND_AUDIO_FORMATS")
                                 or "wav,mp3,ogg").split(",") if f.strip())
         self.template_id = os.environ.get("VS_OURMIND_TEMPLATE_ID") or ""
-        self.delete_after = (os.environ.get("VS_OURMIND_DELETE_AFTER", "true") or "").lower() \
+        # Keep the consultation in the doctor's own OurMind after the report is
+        # in, so it can be found and reopened there. It used to be deleted
+        # straight away (VS_OURMIND_DELETE_AFTER, default on), which made a
+        # recording show up in OurMind for a minute and then vanish. That old
+        # variable is deliberately no longer read: an upgrade re-renders the
+        # chart with the previous release's values, which still say "delete".
+        self.keep = (os.environ.get("VS_OURMIND_KEEP", "true") or "").strip().lower() \
             in ("1", "true", "yes", "on")
 
     # -- plumbing --------------------------------------------------------
@@ -200,12 +206,16 @@ class OurMindProvider:
         if not ok:
             raise ProviderError(why, code="PROVIDER_NOT_CONFIGURED")
 
-        consultation = _id(self._call("POST", "consultations"))
+        title = _clean_title(context.get("title"))
+        consultation = self._create_consultation(title)
         try:
+            # The file name is what OurMind's file list shows; give it the
+            # same human title as the report rather than our internal UUID.
+            file_name = f"{title}{audio.suffix}" if title else audio.name
             file_id = _id(self._call(
                 "POST", f"consultation/{consultation}/files",
                 json_body={"data": {"type": "file",
-                                    "attributes": {"name": audio.name[:140]}}},
+                                    "attributes": {"name": file_name[:140]}}},
             ))
             # An open handle, not read_bytes(): httpx streams it and still
             # sends a real Content-Length, so a 45-minute consultation never
@@ -288,6 +298,9 @@ class OurMindProvider:
         )
 
         attrs = report.get("attributes") or {}
+        title = _clean_title(context.get("title"))
+        if title and self._set_report_title(consultation, report, title):
+            attrs = dict(attrs, title=title)
         note = NoteResult(
             body=text,
             title=attrs.get("title"),
@@ -299,9 +312,44 @@ class OurMindProvider:
             usage=Usage(raw={"reports": 1}),
             provider_ref=consultation,
         )
-        if self.delete_after:
+        if not self.keep:
             self._discard(consultation)
         return note
+
+    # -- titles ----------------------------------------------------------
+    def _create_consultation(self, title: str) -> str:
+        """Create the consultation, with our title if OurMind will take it.
+
+        Their spec documents POST /consultations without a request body, but
+        the consultation resource does carry a `title`. So the title is
+        offered, and if OurMind refuses the body we create it bare: a title
+        must never cost a recording. The report title below is the documented
+        route and is set regardless.
+        """
+        if title:
+            try:
+                return _id(self._call(
+                    "POST", "consultations",
+                    json_body={"data": {"type": "consultation",
+                                        "attributes": {"title": title}}}))
+            except ProviderError as exc:
+                # Only a plain refusal of the body falls back. A 5xx or a
+                # network error is ambiguous -- the consultation may exist --
+                # so it is retried as a whole job instead of doubled here.
+                if exc.code == "PROVIDER_NOT_CONFIGURED" or exc.retryable:
+                    raise
+        return _id(self._call("POST", "consultations"))
+
+    def _set_report_title(self, consultation: str, report: dict, title: str) -> bool:
+        """PATCH the report title (documented). Best effort: never fails a note."""
+        try:
+            self._call(
+                "PATCH", f"consultation/{consultation}/report/{report['id']}",
+                json_body={"data": {"id": str(report["id"]), "type": "report",
+                                    "attributes": {"title": title}}})
+            return True
+        except ProviderError:
+            return False
 
     # -- polling ---------------------------------------------------------
     def _await_transcript(self, consultation: str) -> dict:
@@ -362,6 +410,12 @@ def remember_audio_format(fmt: str) -> None:
 
     if fmt and db.get_meta(AUDIO_FORMAT_KEY) != fmt:
         db.set_meta(AUDIO_FORMAT_KEY, fmt)
+
+
+def _clean_title(value: Any) -> str:
+    """OurMind titles: 1-140 characters with at least one non-space."""
+    text = " ".join(str(value or "").split())[:140]
+    return text if text.strip() else ""
 
 
 def _id(payload: Any) -> str:

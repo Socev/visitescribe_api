@@ -425,7 +425,7 @@ purge happened is always retained.**
 | `VS_OURMIND_BASE_URL` | `https://api.ourmind.ai` | |
 | `VS_OURMIND_API_VERSION` | `2025-05-07` | dated API version, in the path |
 | `VS_OURMIND_TEMPLATE_ID` | *(empty)* | note template; account default when empty |
-| `VS_OURMIND_DELETE_AFTER` | `true` | delete the consultation once the note is in |
+| `VS_OURMIND_KEEP` | `true` | keep the consultation in the doctor's OurMind after the note is in; `false` deletes it (the old `VS_OURMIND_DELETE_AFTER` is no longer read) |
 | `VS_PRICE_OVERRIDES` | *(empty)* | JSON, e.g. `{"mistral:voxtral-mini-2602:audio_minute":0.0025}` |
 | `VS_LOG_LEVEL` | `info` | |
 

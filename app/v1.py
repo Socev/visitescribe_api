@@ -1,8 +1,6 @@
 """The /v1 ingest API — the contract the recorder depends on."""
 from __future__ import annotations
 
-import re
-
 import asyncio
 import json
 from typing import Any
@@ -178,18 +176,18 @@ async def create_session(request: Request) -> Response:
         )
     # A mode the recorder invents is accepted, not rejected -- a new button on
     # the hardware (an "MDO", say) must not need a server release to be usable.
-    # It is registered as a recording type, and an unknown type is assumed to
-    # carry patient audio until a human says otherwise, so the routing policy
-    # treats it in the strictest way rather than the loosest. The shape is
-    # still constrained, so a malformed or hostile value cannot become a row.
+    # It is normalised to a key ("MDO" -> "mdo", "Tel-consult" -> "tel_consult"),
+    # registered as a recording type under the recorder's own label, and shows
+    # up in every user's settings so it can be given an automatic route. An
+    # unknown type is assumed to carry patient audio until a human says
+    # otherwise. Only a mode with nothing usable in it is refused.
+    raw_mode = manifest.mode
+    manifest.mode = users.normalise_mode(raw_mode)
+    if not manifest.mode:
+        raise ApiError("INVALID_MANIFEST",
+                       "mode must contain at least one letter or digit")
     if manifest.mode not in SUPPORTED_MODES:
-        if not re.fullmatch(r"[a-z][a-z0-9_]{2,31}", manifest.mode or ""):
-            raise ApiError(
-                "INVALID_MANIFEST",
-                "mode must be lowercase letters, digits and underscores "
-                f"(3-32 characters), or one of {', '.join(SUPPORTED_MODES)}",
-            )
-        users.ensure_recording_type(manifest.mode)
+        users.ensure_recording_type(manifest.mode, label=raw_mode)
 
     encryption = manifest.encryption
     if (encryption.algorithm or "").upper() != crypto.AES_ALGORITHM:

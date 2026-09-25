@@ -422,7 +422,7 @@ def _add_missing_columns(conn: sqlite3.Connection) -> None:
 # what the provider policy is allowed to reason about.
 BUILTIN_RECORDING_TYPES: tuple[tuple[str, str, str, int, int], ...] = (
     ("single_patient", "Consult", "Eén patiënt, één opname.", 1, 10),
-    ("multi_patient", "Spreekuur", "Meerdere patiënten achter elkaar; "
+    ("multi_patient", "Visite", "Meerdere patiënten achter elkaar; "
      "wordt per patiënt gesplitst en nooit samengevoegd.", 1, 20),
     ("meeting", "Vergadering", "Geen patiëntencontact.", 0, 30),
 )
@@ -438,6 +438,11 @@ def _seed_recording_types(conn: sqlite3.Connection) -> None:
             "ON CONFLICT(mode) DO NOTHING",
             (mode, title, description, patient_audio, position, now_iso()),
         )
+    # The multi-patient type was first seeded as "Spreekuur"; it is the visit
+    # round, and its title now heads every report sent to OurMind ("VISITE -
+    # Patiënt 1 - ..."). Renamed only while it still carries the old seed.
+    conn.execute("UPDATE recording_types SET title = 'Visite' "
+                 "WHERE mode = 'multi_patient' AND builtin = 1 AND title = 'Spreekuur'")
     conn.commit()
 
 

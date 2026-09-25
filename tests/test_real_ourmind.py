@@ -33,6 +33,9 @@ class Handler(BaseHTTPRequestHandler):
     # how this shipped broken.
     reports_404_for: int = 2
     transcripts_404_for: int = 0
+    # OurMind documents POST /consultations without a body. If it ever
+    # refuses one, the consultation must still be created, bare.
+    refuse_consultation_body: bool = False
 
     # -- plumbing --------------------------------------------------------
     def _record(self, body: bytes = b""):
@@ -68,6 +71,9 @@ class Handler(BaseHTTPRequestHandler):
         self._record(body)
         p = self.path
         if p.endswith(f"/{VERSION}/consultations"):
+            if body and Handler.refuse_consultation_body:
+                return self._reply({"errors": [{"code": "invalid-body",
+                    "detail": "request body not allowed"}]}, code=400)
             return self._reply({"data": {"id": "c-1", "type": "consultation"}})
         if p.endswith("/files"):
             return self._reply({"data": {"id": "f-1", "type": "file"}})
@@ -139,6 +145,7 @@ def fake_ourmind(monkeypatch):
     Handler.calls = []
     Handler.reports_404_for = 2
     Handler.transcripts_404_for = 1
+    Handler.refuse_consultation_body = False
     srv = HTTPServer(("127.0.0.1", 0), Handler)
     threading.Thread(target=srv.serve_forever, daemon=True).start()
     base = f"http://127.0.0.1:{srv.server_address[1]}"
@@ -189,7 +196,8 @@ def test_real_ourmind_client_runs_the_documented_flow(server, fake_ourmind,
     assert ("POST", "consultation/c-1/reports/generate") in steps
     assert ("GET", "consultation/c-1/reports") in steps
     assert ("GET", "consultation/c-1/report/r-1/sections") in steps
-    assert steps[-1][0] == "DELETE"
+    # The consultation stays in the doctor's OurMind: nothing is deleted.
+    assert not any(method == "DELETE" for method, _ in steps)
 
     # every call authenticated, and asking for Dutch -- Accept-Language is what
     # decides the report language; it is not the system default.
@@ -311,3 +319,98 @@ def test_a_report_that_never_arrives_still_gives_up(server, fake_ourmind,
     assert "te lang" in (note["error"] or "")
     # retryable, so it waits and tries again rather than being written off
     assert note["state"] == "queued"
+
+
+# --------------------------------------------------------------------------
+# Titles, and keeping the consultation (1.7.0)
+# --------------------------------------------------------------------------
+
+def _run_ourmind(server, monkeypatch, *, mode="single_patient", events=None,
+                 started_at="2026-09-24T07:31:00+02:00"):
+    monkeypatch.setenv("VS_OURMIND_TOKEN", "test-token")
+    monkeypatch.setenv("VS_DISPLAY_TZ", "Europe/Amsterdam")
+    server.register_device("visitescribe-001")
+    rec = Recorder(server, mode=mode)
+    for i in range(3):
+        rec.add_chunk(seconds=1.0, seed=i)
+    manifest = rec.manifest()
+    manifest["started_at"] = started_at
+    assert rec.create(manifest=manifest).status_code == 201
+    rec.upload_all()
+    if events:
+        assert rec.send_events(events).status_code == 200
+    assert rec.complete().json()["ingest_confirmed"] is True
+
+    from app import processing
+
+    processing.enqueue(rec.session_id, "ourmind", actor="test")
+    while processing.run_once():
+        pass
+    for job in processing.jobs_for(rec.session_id):
+        assert job["state"] == "done", dict(job)
+    return rec
+
+
+def _posts(path_end):
+    return [json.loads(c["body"] or b"null") for c in Handler.calls
+            if c["method"] in ("POST", "PATCH") and c["path"].endswith(path_end)]
+
+
+def test_a_consult_is_titled_with_type_and_recording_time(server, fake_ourmind,
+                                                          monkeypatch):
+    rec = _run_ourmind(server, monkeypatch)
+    title = "CONSULT - 24-09-26 - 07:31"
+
+    created = _posts("/consultations")[0]
+    assert created["data"]["attributes"]["title"] == title
+    renamed = _posts("/report/r-1")[0]
+    assert renamed == {"data": {"id": "r-1", "type": "report",
+                                "attributes": {"title": title}}}
+    files = _posts("/files")[0]
+    assert files["data"]["attributes"]["name"].startswith(title)
+    note = server.db.query_one("SELECT title FROM notes WHERE session_id = ?",
+                               (rec.session_id,))
+    assert note["title"] == title
+
+
+def test_each_patient_of_a_round_gets_its_own_time(server, fake_ourmind, monkeypatch):
+    rec = _run_ourmind(server, monkeypatch, mode="multi_patient", events=[
+        {"event": "session_started", "offset_ms": 0, "at": "2026-09-24T07:31:00+02:00"},
+        {"event": "patient_boundary", "offset_ms": 2000, "patient_index": 2,
+         "at": "2026-09-24T07:31:02+02:00"},
+    ], started_at="2026-09-24T07:31:59+02:00")
+    titles = sorted(b["data"]["attributes"]["title"] for b in _posts("/report/r-1"))
+    # patient 2 starts two seconds in, which crosses into 07:32
+    assert titles == ["VISITE - Patiënt 1 - 24-09-26 - 07:31",
+                      "VISITE - Patiënt 2 - 24-09-26 - 07:32"]
+
+
+def test_a_meeting_title(server, fake_ourmind, monkeypatch):
+    _run_ourmind(server, monkeypatch, mode="meeting",
+                 started_at="2026-09-12T12:20:00Z")      # 14:20 in Leusden
+    assert _posts("/report/r-1")[0]["data"]["attributes"]["title"] == \
+        "VERGADERING - 12-09-26 - 14:20"
+
+
+def test_a_refused_consultation_body_still_creates_the_consultation(
+        server, fake_ourmind, monkeypatch):
+    Handler.refuse_consultation_body = True
+    _run_ourmind(server, monkeypatch)
+    creates = [c for c in Handler.calls if c["method"] == "POST"
+               and c["path"].endswith("/consultations")]
+    assert len(creates) == 2 and not creates[1]["body"]
+    # the documented route still titles it
+    assert _posts("/report/r-1")[0]["data"]["attributes"]["title"].startswith("CONSULT")
+
+
+def test_deleting_after_the_report_is_still_possible(server, fake_ourmind, monkeypatch):
+    monkeypatch.setenv("VS_OURMIND_KEEP", "false")
+    _run_ourmind(server, monkeypatch)
+    assert Handler.calls[-1]["method"] == "DELETE"
+
+
+def test_the_old_delete_setting_no_longer_deletes(server, fake_ourmind, monkeypatch):
+    """An upgrade keeps the old chart values, which still say delete."""
+    monkeypatch.setenv("VS_OURMIND_DELETE_AFTER", "true")
+    _run_ourmind(server, monkeypatch)
+    assert not any(c["method"] == "DELETE" for c in Handler.calls)

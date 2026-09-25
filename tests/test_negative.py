@@ -137,9 +137,20 @@ def test_wrong_schema_version(server):
     assert resp.json()["error"]["code"] == "INVALID_SCHEMA_VERSION"
 
 
-def test_a_malformed_mode_is_still_rejected(server):
+def test_a_mode_is_normalised_and_only_an_empty_one_rejected(server):
+    """Since 1.7.0 the recorder's spelling no longer decides whether a
+    recording is accepted: odd modes become safe keys (a-z, 0-9, '_', at most
+    32), and only a mode with nothing usable in it is refused."""
     server.register_device("visitescribe-001")
-    for bad in ("Karaoke", "ka", "with spaces", "x" * 40, "../etc", ""):
+    for raw, key in (("Karaoke", "karaoke"), ("with spaces", "with_spaces"),
+                     ("x" * 40, "x" * 32), ("../etc", "etc")):
+        rec = Recorder(server, mode=raw)
+        rec.add_chunk(seconds=0.2)
+        assert rec.create().status_code == 201, raw
+        row = server.db.query_one("SELECT mode FROM sessions WHERE session_id = ?",
+                                  (rec.session_id,))
+        assert row["mode"] == key
+    for bad in ("", "../", "   "):
         rec = Recorder(server, mode=bad)
         rec.add_chunk(seconds=0.2)
         resp = rec.create()

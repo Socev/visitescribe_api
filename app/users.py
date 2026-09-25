@@ -230,7 +230,19 @@ def recording_types() -> list[dict[str, Any]]:
         "SELECT * FROM recording_types ORDER BY position, mode")]
 
 
-def ensure_recording_type(mode: str) -> None:
+def normalise_mode(raw: str | None) -> str:
+    """The key a recording type is stored under: lowercase, a-z0-9 and '_'.
+
+    Lenient on purpose. A recorder that sends "MDO", "Huisbezoek" or
+    "tel-consult" gets a working category instead of a refused upload;
+    "MDO" and "mdo" are the same category.
+    """
+    import re
+
+    return re.sub(r"[^a-z0-9]+", "_", (raw or "").strip().lower()).strip("_")[:32]
+
+
+def ensure_recording_type(mode: str, label: str | None = None) -> None:
     """Record a mode we have never seen before.
 
     The hardware decides what it sends. When a recorder starts reporting a new
@@ -246,13 +258,26 @@ def ensure_recording_type(mode: str) -> None:
         "INSERT INTO recording_types(mode, title, description, patient_audio, "
         "position, builtin, created_at) VALUES(?,?,?,1,500,0,?) "
         "ON CONFLICT(mode) DO NOTHING",
-        (mode, mode.replace("_", " ").capitalize(),
+        (mode, _label_for(mode, label),
          "Automatisch toegevoegd toen een recorder dit type instuurde.", now_iso()),
     )
     from . import audit
 
     audit.log("recording_types", "discovered", "success", identity="system",
               detail={"mode": mode})
+
+
+def _label_for(mode: str, label: str | None) -> str:
+    text = " ".join((label or "").split())[:40]
+    if text and text != mode:
+        return text
+    return mode.replace("_", " ").capitalize()
+
+
+def type_title(mode: str) -> str:
+    row = db.query_one("SELECT title FROM recording_types WHERE mode = ?", (mode,))
+    return (row["title"] if row and row["title"] else
+            (mode or "opname").replace("_", " ").capitalize())
 
 
 def rules_for(user_id: str) -> dict[str, dict[str, Any]]:

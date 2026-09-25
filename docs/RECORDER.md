@@ -195,3 +195,18 @@ AAD   = "visitescribe-v4-opus:<session uuid>:<sequence>"     (ASCII)
 Each chunk is decoded independently to 16 kHz PCM. Reassembly, patient slicing
 and export work on that PCM exactly as for FLAC/WAV sessions; Mistral receives
 FLAC decoded from the Opus, so there is one lossy generation, not two.
+
+## Recording types (`mode`)
+
+The built-in modes are `single_patient`, `multi_patient` and `meeting`, but the
+recorder may send any category it likes -- a new button needs no server
+release. Since 1.7.0 the value is normalised rather than validated: lowercased,
+every run of other characters turned into `_`, at most 32 characters. `"MDO"`,
+`"mdo"` and `" Mdo "` are one category; `"Tel-consult"` becomes `tel_consult`.
+Only a mode with no letter or digit in it is refused (`INVALID_MANIFEST`).
+
+A category the server has not seen before is registered under the recorder's
+own spelling as its display name, treated as carrying patient audio, and shows
+up in every user's settings, where it can be given an automatic route and
+template like any other. Its display name heads the report title at the
+provider: `MDO - 25-09-26 - 12:00`.

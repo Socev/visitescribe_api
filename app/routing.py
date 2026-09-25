@@ -31,8 +31,10 @@ PROVIDER_PATIENT_AUDIO: dict[str, bool] = {
     # Mistral: EU endpoint available, no training on API data, per-call
     # deletion is not needed because we send audio and keep nothing there.
     "mistral": True,
-    # OurMind: processing within the EEA, ISO 27001 and NEN 7510, and the
-    # recording is deleted again once the report is in.
+    # OurMind: processing within the EEA, ISO 27001 and NEN 7510. Since 1.7.0
+    # the consultation stays in the doctor's own OurMind account after the
+    # report is in (VS_OURMIND_KEEP), at David's request: he wants to find it
+    # there. That is his account, under his own agreement with OurMind.
     "ourmind": True,
 }
 
