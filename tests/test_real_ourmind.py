@@ -364,13 +364,15 @@ def test_a_consult_is_titled_with_type_and_recording_time(server, fake_ourmind,
     created = _posts("/consultations")[0]
     assert created["data"]["attributes"]["title"] == title
     renamed = _posts("/report/r-1")[0]
+    # OurMind's own description is kept behind ours
     assert renamed == {"data": {"id": "r-1", "type": "report",
-                                "attributes": {"title": title}}}
+                                "attributes": {"title": title + " - Consult"}}}
     files = _posts("/files")[0]
     assert files["data"]["attributes"]["name"].startswith(title)
     note = server.db.query_one("SELECT title FROM notes WHERE session_id = ?",
                                (rec.session_id,))
-    assert note["title"] == title
+    # our list shows type and time already; the note keeps OurMind's description
+    assert note["title"] == "Consult"
 
 
 def test_each_patient_of_a_round_gets_its_own_time(server, fake_ourmind, monkeypatch):
@@ -381,15 +383,15 @@ def test_each_patient_of_a_round_gets_its_own_time(server, fake_ourmind, monkeyp
     ], started_at="2026-09-24T07:31:59+02:00")
     titles = sorted(b["data"]["attributes"]["title"] for b in _posts("/report/r-1"))
     # patient 2 starts two seconds in, which crosses into 07:32
-    assert titles == ["VISITE - Patiënt 1 - 24-09-26 - 07:31",
-                      "VISITE - Patiënt 2 - 24-09-26 - 07:32"]
+    assert titles == ["VISITE - Patiënt 1 - 24-09-26 - 07:31 - Consult",
+                      "VISITE - Patiënt 2 - 24-09-26 - 07:32 - Consult"]
 
 
 def test_a_meeting_title(server, fake_ourmind, monkeypatch):
     _run_ourmind(server, monkeypatch, mode="meeting",
                  started_at="2026-09-12T12:20:00Z")      # 14:20 in Leusden
     assert _posts("/report/r-1")[0]["data"]["attributes"]["title"] == \
-        "VERGADERING - 12-09-26 - 14:20"
+        "VERGADERING - 12-09-26 - 14:20 - Consult"
 
 
 def test_a_refused_consultation_body_still_creates_the_consultation(

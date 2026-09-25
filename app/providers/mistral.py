@@ -45,7 +45,11 @@ plaats van iets aannemelijks.
 schrijf dan de meest waarschijnlijke term en zet die tussen vierkante haken, \
 bijvoorbeeld [amoxicilline?].
 - Schrijf bondig en in de derde persoon. Geen aanhef, geen afsluiting.
-- Geef alleen het verslag terug, zonder inleiding of toelichting."""
+- Begin met één regel "Titel: " gevolgd door de kern van het consult in \
+hooguit tien woorden, zonder naam of andere identificerende gegevens, \
+bijvoorbeeld "Titel: Mogelijk astma met piepende ademhaling". Daarna een lege \
+regel en dan het verslag.
+- Geef verder alleen het verslag terug, zonder inleiding of toelichting."""
 
 
 class MistralProvider:
@@ -169,10 +173,11 @@ class MistralProvider:
         if not choices:
             raise ProviderError("Mistral gaf geen verslag terug")
         text = (choices[0].get("message") or {}).get("content") or ""
+        title, text = split_title(text)
         usage = payload.get("usage") or {}
         return NoteResult(
             body=text.strip(),
-            title=None,
+            title=title,
             model=payload.get("model") or self.note_model,
             template="SOEP" if mode != "meeting" else "vergaderverslag",
             usage=Usage(
@@ -211,7 +216,26 @@ Lever in het Nederlands:
 4. Openstaande punten die zijn doorgeschoven.
 
 Neem alleen op wat is uitgesproken. Is een rubriek leeg, schrijf dan dat er \
-niets over is besloten. Geef alleen het verslag terug."""
+niets over is besloten. Begin met één regel "Titel: " gevolgd door het \
+onderwerp van het overleg in hooguit tien woorden, dan een lege regel, en geef \
+verder alleen het verslag terug."""
+
+
+def split_title(text: str) -> tuple[str | None, str]:
+    """Take a leading "Titel: ..." line off the note, if the model wrote one.
+
+    A model that forgets it costs nothing: the note is kept whole and simply
+    has no title.
+    """
+    import re
+
+    stripped = (text or "").lstrip()
+    match = re.match(r"(?:\*\*)?\s*titel\s*:\s*(.+?)\s*(?:\*\*)?\s*(?:\n|$)",
+                     stripped, flags=re.IGNORECASE)
+    if not match:
+        return None, text
+    title = " ".join(match.group(1).strip(" *#").split())[:140] or None
+    return title, stripped[match.end():].lstrip("\n")
 
 
 def _user_message(transcript: TranscriptResult, context: dict[str, Any]) -> str:

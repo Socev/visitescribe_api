@@ -17,8 +17,22 @@ from .admin_html import CSS, JS
 EXTRA_CSS = """
 .hero{display:flex;gap:18px;align-items:flex-start;flex-wrap:wrap;margin-bottom:6px}
 .hero .who{font-size:13px;color:var(--muted)}
-.cards{display:grid;gap:12px;grid-template-columns:repeat(auto-fit,minmax(280px,1fr))}
-.cards+.day{margin-top:28px}
+.list{display:flex;flex-direction:column;gap:10px}
+.list+.day{margin-top:28px}
+.row{display:flex;align-items:center;gap:14px;background:var(--panel);
+ border:1px solid var(--line);border-radius:12px;padding:12px 14px 12px 18px;
+ color:inherit;text-decoration:none}
+.row:hover{border-color:var(--muted)}
+.row .body{flex:1;min-width:0}
+.row .title{font-size:15px;line-height:1.35;overflow:hidden;text-overflow:ellipsis;
+ white-space:nowrap}
+.row .title .seg{color:var(--muted);font-size:13px;margin-right:6px}
+.row .title.none{color:var(--muted);font-style:italic}
+.row .meta{color:var(--muted);font-size:12.5px;margin-top:3px;display:flex;gap:6px;
+ align-items:center;flex-wrap:wrap}
+.row .open{flex:none;background:var(--chip);border-radius:999px;padding:7px 16px;
+ font-size:13.5px;font-weight:500}
+@media(max-width:560px){.row .title{white-space:normal}.row .open{display:none}.row{padding:12px 14px}}
 .day{display:flex;align-items:center;gap:12px;margin:18px 0 10px;font-size:13px;
  font-weight:600;letter-spacing:.02em;text-transform:uppercase;color:var(--muted)}
 .day::after{content:"";flex:1;height:1px;background:var(--line)}
@@ -198,29 +212,52 @@ def render_recordings(d: dict[str, Any], who: str) -> str:
         cards = """<div class="panel"><div class="empty">
 Nog geen opnames. Zodra je recorder iets instuurt verschijnt het hier.</div></div>"""
     else:
-        # One grid per day, newest day first, with the date written once above
+        # One list per day, newest day first, with the date written once above
         # it instead of on every card. The day is the practice's day, so a
         # consultation at 00:30 sits under the night it belongs to, not under
         # the UTC date the row was stored with.
         cards = ""
         for label, day_rows in _by_day(rows):
-            cards += f'<h2 class="day">{_e(label)}</h2><div class="cards">' + "".join(
-                f"""<div class="rec">
-<div class="when">{_e(_when(r))}</div>
-<div class="meta">{_e(types.get(r['mode'], {}).get('title') or r['mode'])}
- · {_e(_duration(r.get('duration_seconds')))}
- {'· ' + _e(str(r['segment_count'])) + ' patiënten' if (r.get('segment_count') or 0) > 1 else ''}</div>
-<div class="foot">{_state_pill(r['state'])}
-{'<span class="pill">' + _e(r['route']) + '</span>' if r.get('route') else ''}
-<span class="spacer" style="flex:1"></span>
-<a href="/opname/{_e(r['session_id'])}">bekijken</a></div>
-</div>""" for r in day_rows) + "</div>"
+            cards += (f'<h2 class="day">{_e(label)}</h2><div class="list">'
+                      + "".join(_row(r, types) for r in day_rows) + "</div>")
     return layout("Mijn opnames", f"""
 <div class="hero"><div><h1>Mijn opnames</h1>
 <p class="sub">Alles wat jouw recorder heeft ingestuurd.
 <span class="live"><span class="dot"></span>ververst zichzelf</span></p></div></div>
 {cards}
 <script>watch('/api/stand');</script>""", active="opnames", who=who)
+
+
+def _row(r: dict[str, Any], types: dict[str, Any]) -> str:
+    """One recording as one line, the way OurMind lists its notes.
+
+    What it was about on top (the note title, one line per patient in a
+    round), and underneath when, what kind, how long and where it went. A
+    recording with no note yet says so instead of showing an empty line.
+    """
+    kind = types.get(r["mode"], {}).get("title") or r["mode"]
+    titles = r.get("titles") or []
+    if titles:
+        many = len(titles) > 1
+        head = "".join(
+            f'<div class="title">'
+            + (f'<span class="seg">Patiënt {_e(t["segment_index"])}</span>'
+               if many and t.get("segment_index") is not None else "")
+            + f'{_e(t["title"])}</div>' for t in titles)
+    else:
+        waiting = r["state"] in ("TRANSCRIBING", "PROCESSING") or \
+            r.get("route")
+        head = (f'<div class="title none">{_e(kind)} · '
+                f'{"wordt verwerkt" if waiting else "nog niet verwerkt"}</div>')
+    patients = (f'<span>· {_e(r["segment_count"])} patiënten</span>'
+                if (r.get("segment_count") or 0) > 1 else "")
+    route = f'<span class="pill">{_e(r["route"])}</span>' if r.get("route") else ""
+    return f"""<a class="row" href="/opname/{_e(r['session_id'])}">
+<div class="body">{head}
+<div class="meta"><span>{_e(_when(r))}</span><span>· {_e(kind)}</span>
+<span>· {_e(_duration(r.get('duration_seconds')))}</span>{patients}
+{_state_pill(r['state'])}{route}</div></div>
+<span class="open">Open</span></a>"""
 
 
 def _started(row: dict[str, Any]) -> str:
@@ -273,6 +310,9 @@ def render_recording(d: dict[str, Any], who: str) -> str:
         # number -- the first consultation of a round showed up as "Patiënt 2".
         title = ("Hele opname" if item.get("segment_index") is None
                  else f"Patiënt {int(item['segment_index'])}")
+        if item.get("title"):
+            title = (item["title"] if item.get("segment_index") is None
+                     else f"{title} · {item['title']}")
         transcript = item.get("transcript") or ""
         note = item.get("note") or ""
         key = "full" if item.get("segment_index") is None else str(item["segment_index"])

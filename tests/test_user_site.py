@@ -844,6 +844,49 @@ def test_recordings_are_grouped_per_practice_day(site, fake_ourmind, server, mon
     thu_div = page.index("onderdag 17 september")
     assert sat_div < late_pos < fri_div < friday_pos < thu_div < thursday_pos
     # the card shows the practice time, and the date only once, on the divider
-    late_card = page[late_pos - 400:late_pos]
+    late_card = page[late_pos:late_pos + 600]
     assert "00:30" in late_card
     assert "2026-09-18" not in page
+
+
+def test_the_list_shows_what_each_recording_was_about(site, fake_ourmind, server,
+                                                      monkeypatch):
+    """One line per recording, OurMind-style: the note title, then the time."""
+    from app import db, users
+    from app.util import now_iso
+
+    monkeypatch.setenv("VS_DISPLAY_TZ", "Europe/Amsterdam")
+    me = users.create("dokter@praktijk.nl")
+    server.register_device("visitescribe-001")
+    users.bind_device("visitescribe-001", me["user_id"])
+
+    titled = Recorder(server, device_id="visitescribe-001")
+    titled.add_chunk(seconds=0.5)
+    manifest = titled.manifest()
+    manifest["started_at"] = "2026-09-25T13:48:00Z"
+    assert titled.create(manifest=manifest).status_code == 201
+    titled.upload_all(); titled.complete()
+    ts = now_iso()
+    db.execute("INSERT INTO notes(session_id, segment_index, provider, model, "
+               "template, title, body, codes_json, status, created_at, updated_at) "
+               "VALUES(?,?,?,?,?,?,?,?,'draft',?,?)",
+               (titled.session_id, None, "ourmind", "ourmind", "", 
+                "Mogelijk astma met piepende ademhaling", "S: ...", "[]", ts, ts))
+
+    bare = Recorder(server, device_id="visitescribe-001")
+    bare.add_chunk(seconds=0.5)
+    bare.create(); bare.upload_all(); bare.complete()
+
+    _sign_in(site)
+    page = site.get("/").text
+    row = page[page.index(titled.session_id):]
+    row = row[:row.index("</a>")]
+    assert "Mogelijk astma met piepende ademhaling" in row
+    assert "15:48" in row and "Open" in row
+    other = page[page.index(bare.session_id):]
+    assert "nog niet verwerkt" in other[:other.index("</a>")]
+    # a title arriving changes the fingerprint the page polls
+    before = site.get("/api/stand").json()["stand"]
+    db.execute("UPDATE notes SET title = 'Anders', updated_at = ? "
+               "WHERE session_id = ?", ("2099-01-01T00:00:00Z", titled.session_id))
+    assert site.get("/api/stand").json()["stand"] != before

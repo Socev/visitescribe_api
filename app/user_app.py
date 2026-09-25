@@ -65,7 +65,23 @@ def _recordings_of(user_id: str, limit: int = 200) -> list[dict[str, Any]]:
         "ORDER BY COALESCE(s.started_at, s.created_at) DESC LIMIT ?",
         (user_id, limit),
     )
-    return [dict(r) for r in rows]
+    out = [dict(r) for r in rows]
+    # The note titles, one per patient, so the list can say what each
+    # recording was about ("Mogelijk astma met piepende ademhaling") rather
+    # than only when it was made.
+    by_id = {r["session_id"]: r for r in out}
+    for r in out:
+        r["titles"] = []
+    if by_id:
+        marks = ",".join("?" * len(by_id))
+        for note in db.query(
+                f"SELECT session_id, segment_index, title FROM notes "
+                f"WHERE session_id IN ({marks}) ORDER BY IFNULL(segment_index, 0)",
+                tuple(by_id)):
+            if note["title"]:
+                by_id[note["session_id"]]["titles"].append(
+                    {"segment_index": note["segment_index"], "title": note["title"]})
+    return out
 
 
 def _recording_of(user_id: str, session_id: str) -> dict[str, Any]:
@@ -148,6 +164,7 @@ def create_user_app() -> FastAPI:
         for item in results["notes"]:
             entry = by_segment.setdefault(item["segment_index"], {})
             entry["note"] = item["body"]
+            entry["title"] = item.get("title") or ""
         merged = [{"segment_index": k, **v} for k, v in sorted(
             by_segment.items(), key=lambda kv: (kv[0] is not None, kv[0]))]
         busy = any(j["state"] in ("queued", "running") for j in results["jobs"])
@@ -258,10 +275,16 @@ def create_user_app() -> FastAPI:
                     f"{state.get('state')}")
         else:
             row = db.row_to_dict(db.query_one(
-                "SELECT COUNT(*) AS n, MAX(s.updated_at) AS u FROM sessions s "
+                "SELECT COUNT(*) AS n, MAX(s.updated_at) AS u, "
+                "(SELECT COUNT(*) || ':' || IFNULL(MAX(nt.updated_at), '') "
+                " FROM notes nt JOIN sessions s2 ON s2.session_id = nt.session_id "
+                " JOIN devices d2 ON d2.device_id = s2.device_id "
+                " WHERE d2.user_id = ?) AS notes "
+                "FROM sessions s "
                 "JOIN devices d ON d.device_id = s.device_id WHERE d.user_id = ?",
-                (user["user_id"],))) or {}
-            mark = f"{row.get('n')}:{row.get('u')}"
+                (user["user_id"], user["user_id"]))) or {}
+            # Notes too: a title arriving is exactly what the list must show.
+            mark = f"{row.get('n')}:{row.get('u')}:{row.get('notes')}"
         return JSONResponse({"stand": mark})
 
     @app.get("/healthz")

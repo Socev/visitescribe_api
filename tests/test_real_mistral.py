@@ -76,6 +76,7 @@ class Handler(BaseHTTPRequestHandler):
             payload = {
                 "model": "mistral-medium-3.5",
                 "choices": [{"message": {"content":
+                             "Titel: Spanningshoofdpijn\n\n"
                              "S: hoofdpijn\nO: geen afwijkingen\nE: spanningshoofdpijn\nP: paracetamol"}}],
                 "usage": {"prompt_tokens": 500, "completion_tokens": 80,
                           "total_tokens": 580},
@@ -154,6 +155,9 @@ def test_real_mistral_client_runs_a_real_session(server, fake_mistral, monkeypat
     results = processing.results_for(rec.session_id)
     assert results["transcripts"] and "hoofdpijn" in results["transcripts"][0]["text"]
     assert results["notes"] and "S:" in results["notes"][0]["body"]
+    # the title line becomes the note's title and leaves the report itself
+    assert results["notes"][0]["title"] == "Spanningshoofdpijn"
+    assert results["notes"][0]["body"].startswith("S:")
 
     usage = processing.usage_for(rec.session_id)
     ops = {u["operation"]: u for u in usage}

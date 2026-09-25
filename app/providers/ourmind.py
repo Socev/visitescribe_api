@@ -298,12 +298,21 @@ class OurMindProvider:
         )
 
         attrs = report.get("attributes") or {}
-        title = _clean_title(context.get("title"))
-        if title and self._set_report_title(consultation, report, title):
-            attrs = dict(attrs, title=title)
+        # OurMind writes its own title for the report ("Mogelijk astma met
+        # piepende ademhaling"), which is what makes a list of notes readable.
+        # Ours ("VISITE - Patiënt 1 - 24-09-26 - 07:31") says what and when.
+        # In OurMind the two are joined, ours first; here the note keeps
+        # OurMind's description, because our list already shows type and time.
+        described = _clean_title(attrs.get("title"))
+        prefix = _clean_title(context.get("title"))
+        if prefix:
+            full = prefix
+            if described and not described.startswith(prefix):
+                full = f"{prefix} - {described}"
+            self._set_report_title(consultation, report, _clean_title(full))
         note = NoteResult(
             body=text,
-            title=attrs.get("title"),
+            title=described or None,
             model="ourmind",
             template=str(attrs.get("template_id") or chosen_id or ""),
             codes=attrs.get("codes") or [],
