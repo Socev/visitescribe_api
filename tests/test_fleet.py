@@ -285,7 +285,8 @@ def test_admin_can_queue_and_cancel_wifi(server, linked):
 # firmware
 # ---------------------------------------------------------------------------
 
-def make_image(version="0.8.1", chip_id=9, size=8192, magic=0xE9) -> bytes:
+def make_image(version="0.8.1", chip_id=9, size=8192, magic=0xE9,
+               board="cores3-lite") -> bytes:
     head = bytearray(32)
     head[0] = magic
     head[1] = 3
@@ -293,7 +294,7 @@ def make_image(version="0.8.1", chip_id=9, size=8192, magic=0xE9) -> bytes:
     desc = bytearray(256)
     desc[0:4] = (0xABCD5432).to_bytes(4, "little")
     desc[16:16 + len(b"esp-idf")] = b"esp-idf"
-    marker = f"VSFW|version={version}|board=cores3-lite|".encode()
+    marker = f"VSFW|version={version}|board={board}|".encode()
     body = bytes(head) + bytes(desc) + marker
     return body + bytes(size - len(body))
 
@@ -410,6 +411,48 @@ def test_the_ota_policy_never_goes_below_twenty_percent(server, linked, override
         upd = _config(server, BRIAN, linked["token"])["firmware_update"]
     assert upd["min_battery_charging"] == 20
     assert upd["min_battery_unplugged"] == 20
+
+
+def test_an_image_only_goes_to_a_recorder_of_its_own_board(server, linked):
+    """CoreS3-Lite and StickS3 have different flash layouts (1.12.0)."""
+    stick_id = "brian-0000000000aa"
+    stick = _enroll(server, stick_id,
+                    hardware={"mac": "00:00:00:00:00:aa", "board": "sticks3"}).json()
+    from app import users
+    doctor = users.get(linked["user"]["user_id"])
+    assert _link(server, stick["enrolment"]["pairing_code"],
+                 doctor["user_id"]).status_code == 200
+
+    cores3 = _upload(server, make_image("0.10.1")).json()["release"]
+    stick_rel = _upload(server, make_image("0.10.1s", board="sticks3")).json()["release"]
+    assert stick_rel["board"] == "sticks3"
+
+    r = server.admin.post(f"/admin/api/devices/{stick_id}/firmware",
+                          json={"release_id": cores3["release_id"]})
+    assert r.status_code == 409 and r.json()["error"]["code"] == "WRONG_BOARD"
+    r = server.admin.post(f"/admin/api/devices/{BRIAN}/firmware",
+                          json={"release_id": stick_rel["release_id"]})
+    assert r.status_code == 409
+
+    # A mixed selection assigns nothing at all.
+    r = server.admin.post(f"/admin/api/firmware/{cores3['release_id']}/assign",
+                          json={"device_ids": [BRIAN, stick_id]})
+    assert r.status_code == 409
+    from app import fleet
+    assert fleet.update_of(BRIAN) is None
+
+    r = server.admin.post(f"/admin/api/devices/{stick_id}/firmware",
+                          json={"release_id": stick_rel["release_id"]})
+    assert r.status_code == 200
+    upd = _config(server, stick_id, stick["token"])["firmware_update"]
+    assert upd["board"] == "sticks3"
+
+    # A recorder that never reported a board is a CoreS3-Lite.
+    server.db.execute("UPDATE devices SET hardware_json = '{}' WHERE device_id = ?", (BRIAN,))
+    r = server.admin.post(f"/admin/api/devices/{BRIAN}/firmware",
+                          json={"release_id": cores3["release_id"]})
+    assert r.status_code == 200
+    assert "sticks3" in server.admin.get("/admin/firmware").text
 
 
 # ---------------------------------------------------------------------------

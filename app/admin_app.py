@@ -715,6 +715,17 @@ def create_admin_app() -> FastAPI:
         ids = body.get("device_ids") or []
         if not isinstance(ids, list) or not ids:
             raise ApiError("INVALID_REQUEST", "Kies minstens één apparaat.")
+        # Check every recorder before assigning any, so a wrong board in the
+        # selection leaves nothing half done.
+        release = fleet.get_release(release_id)
+        if release is None:
+            raise ApiError("UNKNOWN_RELEASE", "Onbekende firmware")
+        for d in ids:
+            row = db.query_one("SELECT * FROM devices WHERE device_id = ?", (str(d),))
+            if row is not None:
+                why = fleet.board_mismatch(dict(row), release)
+                if why:
+                    raise ApiError("WRONG_BOARD", why)
         done = [fleet.assign(str(d), release_id, actor=who)["device_id"] for d in ids]
         return JSONResponse({"assigned": done})
 
@@ -1022,9 +1033,12 @@ def _devices_data() -> dict[str, Any]:
 def _firmware_data() -> dict[str, Any]:
     devices = []
     for r in db.query("SELECT d.device_id, d.display_name, d.software_version, "
-                      "d.battery_percent, d.last_seen_at, d.charging FROM devices d "
+                      "d.battery_percent, d.last_seen_at, d.charging, d.hardware_json "
+                      "FROM devices d "
                       "WHERE IFNULL(d.enrol_state, '') != 'pending' ORDER BY d.device_id"):
         item = dict(r)
+        item["board"] = fleet.device_board(item) or "cores3-lite"
+        item.pop("hardware_json", None)
         upd = fleet.update_of(item["device_id"])
         item["update"] = upd
         devices.append(item)
@@ -1062,8 +1076,11 @@ def _device_detail(device_id: str) -> dict[str, Any] | None:
             "AND audio_purged_at IS NULL AND state != 'PURGED'", (device_id,))
             or {"n": 0})["n"]),
         "diagnostic_days": settings.diagnostic_audio_days,
+        # Only images this recorder's board can run (CoreS3-Lite / StickS3).
         "releases": [{"release_id": r["release_id"], "version": r["version"],
-                      "created_at": r["created_at"]} for r in fleet.releases()],
+                      "created_at": r["created_at"], "board": r.get("board") or ""}
+                     for r in fleet.releases()
+                     if not fleet.board_mismatch(dict(row), dict(r))],
     }
 
 

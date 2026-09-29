@@ -561,11 +561,38 @@ def delete_release(release_id: str, *, actor: str) -> None:
               detail={"release_id": release_id, "version": release["version"]})
 
 
+def device_board(device: dict[str, Any]) -> str:
+    """The board a recorder reported ("cores3-lite", "sticks3"), or ""."""
+    try:
+        hw = json.loads(device.get("hardware_json") or "{}")
+    except (TypeError, ValueError):
+        return ""
+    board = hw.get("board") if isinstance(hw, dict) else ""
+    return board if isinstance(board, str) else ""
+
+
+def board_mismatch(device: dict[str, Any], release: dict[str, Any]) -> str:
+    """Why this image may not go to this recorder, or "" when it may.
+
+    Brian runs on two boards with different flash layouts; an image for the
+    other one would not even fit. A recorder that has not reported its board
+    yet (hand-registered before 0.8) is a CoreS3-Lite.
+    """
+    have = device_board(device) or "cores3-lite"
+    want = (release.get("board") or "").strip()
+    if want and want != have:
+        return (f"Deze firmware is voor {want}; {device['device_id']} is een {have}.")
+    return ""
+
+
 def assign(device_id: str, release_id: str, *, actor: str) -> dict[str, Any]:
     device = _device(device_id)
     release = get_release(release_id)
     if release is None:
         raise ApiError("UNKNOWN_RELEASE", "Onbekende firmware")
+    why = board_mismatch(device, release)
+    if why:
+        raise ApiError("WRONG_BOARD", why)
     ts = now_iso()
     state = "installed" if device.get("software_version") == release["version"] else "pending"
     db.execute(
@@ -609,6 +636,8 @@ def update_block(device: dict[str, Any]) -> dict[str, Any] | None:
         return None
     if upd["state"] == "failed" and int(upd["attempts"]) >= settings.ota_max_attempts:
         return None
+    if board_mismatch(device, upd):
+        return None          # never offered, even if it was assigned before 1.12
     return {
         "release_id": upd["release_id"],
         "version": upd["version"],
@@ -617,6 +646,7 @@ def update_block(device: dict[str, Any]) -> dict[str, Any] | None:
         "url": f"/v1/device/firmware/{upd['release_id']}",
         "min_battery_charging": max(20, settings.ota_min_battery_charging),
         "min_battery_unplugged": max(20, settings.ota_min_battery_unplugged),
+        "board": upd.get("board") or "",
     }
 
 

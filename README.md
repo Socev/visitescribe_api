@@ -360,7 +360,11 @@ is wiped from the server as soon as the recorder confirms it. Admins upload
 firmware images (**Firmware**) and set them out per device; the recorder
 installs only when idle with enough battery and a charger (or a nearly full
 battery), verifies the SHA-256 first, and the update counts as installed only
-when the recorder returns running the new version. Details and the wire format:
+when the recorder returns running the new version. Brian runs on two boards
+(`cores3-lite` and, since 1.12.0, the M5Stack `sticks3`); each image carries
+its board in the `VSFW` marker, every heartbeat reports the recorder's board,
+and an image is only ever assigned to (and offered in `firmware_update.board`
+to) a recorder of the same board. Details and the wire format:
 [`docs/RECORDER.md`](docs/RECORDER.md#joining-wi-fi-and-updates-over-the-air-since-190).
 
 | Variable | Default | Meaning |

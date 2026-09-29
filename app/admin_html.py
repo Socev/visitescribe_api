@@ -1440,13 +1440,14 @@ def render_firmware(d: dict[str, Any], who: str) -> str:
 Verwijderen</button></td></tr>"""
         for r in d["releases"]
     ) or '<tr><td colspan="8" class="muted">Nog geen firmware geüpload.</td></tr>'
-    rel_opts = "".join(f'<option value="{_e(r["release_id"])}">{_e(r["version"])}</option>'
+    rel_opts = "".join(f'<option value="{_e(r["release_id"])}">{_e(r["version"])}'
+                       f'{" (" + _e(r["board"]) + ")" if r.get("board") else ""}</option>'
                        for r in d["releases"])
     dev_rows = "".join(
         f"""<tr><td><input type="checkbox" class="fwdev" value="{_e(x['device_id'])}"
  style="width:auto"></td><td><a href="/admin/devices/{_e(x['device_id'])}">{_e(x['device_id'])}</a>
 <div class="muted">{_e(x['display_name'])}</div></td>
-<td>{_e(x['software_version'] or '—')}</td>
+<td>{_e(x['software_version'] or '—')}<div class="muted">{_e(x.get('board') or '')}</div></td>
 <td>{_e(x['battery_percent'] if x['battery_percent'] is not None else '—')}%
 {'· lader' if x.get('charging') else ''}</td>
 <td class="muted nowrap">{_e(_t(x['last_seen_at']) or '—')}</td>
