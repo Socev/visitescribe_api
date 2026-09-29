@@ -80,6 +80,7 @@ Base: `https://scribe.primumnonnocere.olares.com/v1`
 | `POST` | `/device/enroll` | a new recorder announces itself (no credentials) |
 | `GET`  | `/device/firmware/{release_id}` | download a firmware image set out for this device |
 | `POST` | `/device/firmware/report` | update progress: deferred / installing / failed |
+| `POST` | `/device/logs` | lines of the recorder's own log, sent at every sync |
 
 Plus `/healthz`, `/readyz` and OpenAPI at `/v1/docs`.
 
@@ -367,6 +368,8 @@ when the recorder returns running the new version. Details and the wire format:
 | `VS_OTA_MIN_BATTERY_UNPLUGGED` | `80` | battery needed to update without a charger |
 | `VS_OTA_MAX_ATTEMPTS` | `3` | downloads before a failing update stops being offered |
 | `VS_MAX_FIRMWARE_BYTES` | `6291456` | largest accepted image (one OTA slot is 6.25 MiB) |
+| `VS_DEVICE_LOG_DAYS` | `30` | how long recorder log lines are kept |
+| `VS_DEVICE_LOG_MAX_LINES` | `200000` | log lines kept per device |
 
 ---
 

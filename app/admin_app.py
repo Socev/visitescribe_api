@@ -18,7 +18,7 @@ from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse, Stre
 
 from urllib.parse import unquote
 
-from . import (__version__, adminauth, audio, audit, crypto, db, fleet, flacinfo,
+from . import (__version__, adminauth, audio, audit, crypto, db, devicelogs, fleet, flacinfo,
                pricing, processing, routing, sessions, storage, users)
 from .providers import credentials as provider_credentials
 from .providers import get as get_provider
@@ -643,6 +643,27 @@ def create_admin_app() -> FastAPI:
         return JSONResponse({"update": fleet.assign(
             device_id, str(body.get("release_id") or ""), actor=who)})
 
+    @app.get("/admin/api/devices/{device_id}/logs", include_in_schema=False)
+    async def api_device_logs(device_id: str, request: Request, q: str = "",
+                              limit: int = 300) -> JSONResponse:  # noqa: ANN202
+        guard(request)
+        device = fleet._device(device_id)
+        return JSONResponse({"lines": devicelogs.lines(device_id, q=q, limit=limit),
+                             "status": devicelogs.status(device)})
+
+    @app.get("/admin/api/devices/{device_id}/logs.txt", include_in_schema=False)
+    async def api_device_logs_txt(device_id: str, request: Request):  # noqa: ANN202
+        guard(request)
+        fleet._device(device_id)
+        return Response(devicelogs.export_text(device_id), media_type="text/plain; charset=utf-8",
+                        headers={"Content-Disposition":
+                                 f'attachment; filename="{device_id}-log.txt"'})
+
+    @app.post("/admin/api/devices/{device_id}/logs/request", include_in_schema=False)
+    async def api_device_logs_request(device_id: str, request: Request) -> JSONResponse:  # noqa: ANN202
+        who = guard(request)
+        return JSONResponse({"request_id": devicelogs.request_full(device_id, actor=who)})
+
     @app.post("/admin/api/firmware", include_in_schema=False)
     async def api_upload_firmware(request: Request) -> JSONResponse:  # noqa: ANN202
         who = guard(request)
@@ -689,6 +710,7 @@ def create_admin_app() -> FastAPI:
         db.execute("DELETE FROM devices WHERE device_id = ?", (device_id,))
         db.execute("DELETE FROM device_wifi_ops WHERE device_id = ?", (device_id,))
         db.execute("DELETE FROM device_updates WHERE device_id = ?", (device_id,))
+        db.execute("DELETE FROM device_log_lines WHERE device_id = ?", (device_id,))
         audit.log("device", "deleted", "success", device_id=device_id, identity=who)
         return JSONResponse({"ok": True})
 
@@ -1007,6 +1029,7 @@ def _device_detail(device_id: str) -> dict[str, Any] | None:
         "audit": audit.recent(limit=100, device_id=device_id),
         "wifi": fleet.wifi_view(dict(row)),
         "update": fleet.update_of(device_id),
+        "logs": devicelogs.status(dict(row)),
         "releases": [{"release_id": r["release_id"], "version": r["version"],
                       "created_at": r["created_at"]} for r in fleet.releases()],
     }

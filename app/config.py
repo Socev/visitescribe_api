@@ -125,6 +125,13 @@ class Settings:
     max_firmware_bytes: int = field(
         default_factory=lambda: _i("VS_MAX_FIRMWARE_BYTES", 6 * 1024 * 1024))
 
+    # --- recorder logs (app/devicelogs.py) ---------------------------------
+    device_log_days: int = field(default_factory=lambda: _i("VS_DEVICE_LOG_DAYS", 30))
+    device_log_max_lines: int = field(
+        default_factory=lambda: _i("VS_DEVICE_LOG_MAX_LINES", 200_000))
+    device_log_max_upload: int = field(
+        default_factory=lambda: _i("VS_DEVICE_LOG_MAX_UPLOAD", 256 * 1024))
+
     public_base_url: str = field(default_factory=lambda: _s("VS_PUBLIC_BASE_URL", ""))
     log_level: str = field(default_factory=lambda: _s("VS_LOG_LEVEL", "info"))
 

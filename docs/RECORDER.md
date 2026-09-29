@@ -301,3 +301,29 @@ Admin → **Firmware** accepts only an ESP32-S3 application image (magic `0xE9`,
 chip id 9). The version is read from the marker the VisiteScribe firmware
 embeds, `VSFW|version=<v>|board=<b>|`; the version the recorder reports in its
 heartbeat must be the same string.
+
+
+## The recorder's logbook (since 1.10.0)
+
+Everything the recorder prints (what a serial monitor shows) is kept on the
+recorder and sent at every sync:
+
+```
+POST /v1/device/logs            (normal device auth, text/plain, ≤ 256 KiB)
+X-Log-Request: 7                (only on the last chunk of a requested full log)
+
+B12.340 2026-09-29T12:00:01Z 81234 FLEET: seen SehrToll rssi=-61 dBm auth=3 ch=6
+B12.341 - 81300 WIFI: connected profile 1 SSID=SehrToll
+```
+
+`B<boot>.<line>` is the recorder's own numbering (boot counter, line within
+that boot) and the key on the server, so resending is harmless. The time is
+`-` until the clock is set. Send the lines added since the last *successful*
+upload, oldest first; keep the high-water mark only after a `200`.
+
+`GET /v1/device/config` carries `"log_request": {"id": 7}` after an admin
+clicked *Haal volledige log op*: resend everything still kept and put the id
+in `X-Log-Request` on the final chunk; the block disappears once it arrived.
+
+Kept `VS_DEVICE_LOG_DAYS` (30) days and at most `VS_DEVICE_LOG_MAX_LINES`
+(200 000) lines per device. Admin-only (device page, *Logboek*).

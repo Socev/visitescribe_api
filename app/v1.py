@@ -11,7 +11,7 @@ from pydantic import ValidationError
 
 from fastapi.responses import FileResponse
 
-from . import (audit, crypto, db, fleet, flacinfo, idempotency, processing, ratelimit,
+from . import (audit, crypto, db, devicelogs, fleet, flacinfo, idempotency, processing, ratelimit,
                sessions, storage, users)
 from .auth import DeviceIdentity, authenticate, client_ip
 from .config import SUPPORTED_MODES, settings
@@ -945,6 +945,9 @@ async def device_config(request: Request) -> Response:
     update = fleet.update_block(ident.row)
     if update:
         config["firmware_update"] = update
+    log_request = devicelogs.config_block(ident.row)
+    if log_request:
+        config["log_request"] = log_request
     key = crypto.active_key()
     if key:
         config["server_key"] = {
@@ -1054,6 +1057,17 @@ async def device_firmware(release_id: str, request: Request) -> Response:
         headers={"X-Firmware-SHA256": release["sha256"],
                  "X-Firmware-Version": release["version"],
                  "Cache-Control": "no-store"})
+
+
+@router.post("/device/logs")
+async def device_logs(request: Request) -> Response:
+    """Lines of the recorder's own log (see app/devicelogs.py). Idempotent."""
+    ident = _identity(request)
+    body = await _read_capped(request, settings.device_log_max_upload, "Log upload")
+    req = (request.headers.get("x-log-request") or "").strip()
+    result = devicelogs.ingest(ident.device_id, body,
+                               request_id=int(req) if req.isdigit() else None)
+    return JSONResponse(status_code=200, content=result)
 
 
 @router.post("/device/firmware/report")

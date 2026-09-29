@@ -494,3 +494,61 @@ def test_the_recorder_learns_whose_ourmind_account_it_serves(server, linked):
     users.bind_device(BRIAN, None)
     cfg = _config(server, BRIAN, linked["token"])
     assert cfg["enrolment"]["owner"] is None and cfg["enrolment"]["linked"] is False
+
+
+# ---------------------------------------------------------------------------
+# recorder logs
+# ---------------------------------------------------------------------------
+
+def _post_log(server, token, text, request_id=None):
+    headers = {**_auth(BRIAN, token), "Content-Type": "text/plain"}
+    if request_id:
+        headers["X-Log-Request"] = str(request_id)
+    return server.client.post("/v1/device/logs", content=text.encode(), headers=headers)
+
+
+def test_log_lines_arrive_once_and_are_shown_to_the_admin(server, linked):
+    tok = linked["token"]
+    batch = ("B3.1 2026-09-29T12:00:00Z 1200 BOOT: reset_reason=3\n"
+             "B3.2 - 1300 FLEET: seen SehrToll rssi=-61 dBm auth=3 ch=6\n"
+             "garbage line\n")
+    r = _post_log(server, tok, batch)
+    assert r.status_code == 200
+    assert r.json()["stored"] == 2 and r.json()["rejected"] == 1
+    assert r.json()["highest"] == {"boot": 3, "line": 2}
+    # resent after a dropped reply: nothing doubles
+    assert _post_log(server, tok, batch).json()["stored"] == 0
+    _post_log(server, tok, "B4.1 - 10 WIFI: connected\n")
+
+    server.admin_login()
+    lines = server.admin.get(f"/admin/api/devices/{BRIAN}/logs").json()["lines"]
+    assert [(l["boot"], l["line"]) for l in lines] == [(3, 1), (3, 2), (4, 1)]
+    only = server.admin.get(f"/admin/api/devices/{BRIAN}/logs?q=SehrToll").json()["lines"]
+    assert len(only) == 1 and "SehrToll" in only[0]["text"]
+    txt = server.admin.get(f"/admin/api/devices/{BRIAN}/logs.txt").text
+    assert txt.splitlines()[0].startswith("B3.1 2026-09-29T12:00:00Z 1200 BOOT")
+    assert "Logboek" in server.admin.get(f"/admin/devices/{BRIAN}").text
+
+
+def test_a_full_log_request_travels_in_config_until_answered(server, linked):
+    tok = linked["token"]
+    assert "log_request" not in _config(server, BRIAN, tok)
+    server.admin_login()
+    rid = server.admin.post(f"/admin/api/devices/{BRIAN}/logs/request", json={}).json()["request_id"]
+    assert _config(server, BRIAN, tok)["log_request"] == {"id": rid}
+    _post_log(server, tok, "B1.1 - 5 old line\n", request_id=rid)
+    assert "log_request" not in _config(server, BRIAN, tok)
+
+
+def test_log_uploads_are_bounded_and_authenticated(server, linked, override_settings):
+    r = server.client.post("/v1/device/logs", content=b"B1.1 - 1 x\n",
+                           headers={"X-Device-ID": BRIAN})
+    assert r.status_code == 401
+    with override_settings(device_log_max_upload=100):
+        r = _post_log(server, linked["token"], "B1.1 - 1 " + "x" * 200 + "\n")
+    assert r.status_code == 413
+    with override_settings(device_log_max_lines=3):
+        _post_log(server, linked["token"], "".join(f"B1.{i} - {i} l{i}\n" for i in range(1, 6)))
+    server.admin_login()
+    kept = server.admin.get(f"/admin/api/devices/{BRIAN}/logs").json()["lines"]
+    assert [l["line"] for l in kept] == [3, 4, 5]

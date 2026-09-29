@@ -392,6 +392,22 @@ CREATE TABLE IF NOT EXISTS device_updates (
     updated_at    TEXT NOT NULL
 );
 
+-- The recorder's own log, line by line. (boot, line) is the recorder's
+-- numbering: the boot counter and the line within that boot, so a resend is
+-- ignored rather than duplicated. No patient data: session numbers, network
+-- names, battery -- see app/devicelogs.py.
+CREATE TABLE IF NOT EXISTS device_log_lines (
+    device_id    TEXT NOT NULL,
+    boot         INTEGER NOT NULL,
+    line         INTEGER NOT NULL,
+    device_time  TEXT,
+    uptime_ms    INTEGER,
+    text         TEXT NOT NULL,
+    received_at  TEXT NOT NULL,
+    PRIMARY KEY (device_id, boot, line)
+);
+CREATE INDEX IF NOT EXISTS idx_log_received ON device_log_lines(received_at);
+
 CREATE TABLE IF NOT EXISTS meta (
     key   TEXT PRIMARY KEY,
     value TEXT NOT NULL
@@ -458,6 +474,11 @@ ADDED_COLUMNS: tuple[tuple[str, str, str], ...] = (
     ("devices", "wifi_networks_json", "TEXT"),    # SSIDs as reported, no passwords
     ("devices", "wifi_ops_applied", "INTEGER NOT NULL DEFAULT 0"),
     ("devices", "charging", "INTEGER"),
+    # "Haal volledige log op": the recorder resends everything it kept until
+    # it reports this request id back.
+    ("devices", "log_request_id", "INTEGER NOT NULL DEFAULT 0"),
+    ("devices", "log_request_done", "INTEGER NOT NULL DEFAULT 0"),
+    ("devices", "log_request_at", "TEXT"),
 )
 
 

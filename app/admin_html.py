@@ -690,6 +690,7 @@ certificate (DER). Once pinned, every request from this device must present it.<
 {_enrolment_panel(d)}
 {_wifi_panel(d)}
 {_device_firmware_panel(d)}
+{_device_logs_panel(d)}
 <div class="panel"><h3 style="margin-top:0">Device configuration</h3>
 <p class="muted" style="margin-top:0">Returned by <code>GET /v1/device/config</code>.
 Security-critical values cannot be weakened from here.</p>
@@ -1479,3 +1480,36 @@ async function fwDelete(id){{ if(!confirm('Deze firmware verwijderen?'))return;
   await act('/admin/api/firmware/'+encodeURIComponent(id),{{}},'DELETE'); location.reload(); }}
 </script>"""
     return layout("Firmware", body, "firmware", who)
+
+
+def _device_logs_panel(d: dict[str, Any]) -> str:
+    st = d.get("logs") or {}
+    req = ""
+    if st.get("requested"):
+        req = (f'<span class="chip info">volledige log aangevraagd {_e(_t(st.get("requested_at")))}'
+               '</span> — komt bij de volgende synchronisatie.')
+    return f"""<div class="panel"><h3 style="margin-top:0">Logboek</h3>
+<p class="muted" style="margin-top:0">Wat Brian in de seriële monitor zou tonen. Nieuwe regels
+komen mee bij elke synchronisatie; bewaard {_e(st.get('lines', 0))} regels, laatst ontvangen
+{_e(_t(st.get('last_received')) or '—')}. {req}</p>
+<div class="row"><div><input id="logq" placeholder="Filter, bijv. FLEET, WIFI, ERROR"
+ onkeydown="if(event.key==='Enter')loadLog()"></div>
+<div class="narrow"><button onclick="loadLog()">Toon</button></div>
+<div class="narrow"><a class="btn" href="{'/admin/api/devices/'}"
+ onclick="this.href=base+'/logs.txt'">Download .txt</a></div>
+<div class="narrow"><button onclick="requestLog()">Haal volledige log op</button></div></div>
+<pre id="logbox" style="margin-top:12px;max-height:480px;overflow:auto;white-space:pre-wrap">…</pre>
+<script>
+async function loadLog(){{
+  const q=document.getElementById('logq').value;
+  const r=await api(base+'/logs?limit=300&q='+encodeURIComponent(q));
+  const box=document.getElementById('logbox');
+  box.textContent=r.lines.length? r.lines.map(l=>'B'+l.boot+'.'+l.line+'  '+
+    (l.device_time||('+'+l.uptime_ms+'ms'))+'  '+l.text).join('\n') : 'Nog geen regels.';
+  box.scrollTop=box.scrollHeight;
+}}
+async function requestLog(){{ await act(base+'/logs/request',{{}});
+  toast('Aangevraagd: Brian stuurt alles bij de volgende synchronisatie','ok');
+  setTimeout(()=>location.reload(),900); }}
+document.addEventListener('DOMContentLoaded',()=>loadLog().catch(()=>{{}}));
+</script></div>"""
