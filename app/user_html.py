@@ -118,6 +118,7 @@ def layout(title: str, body: str, active: str = "", who: str = "",
     signout = ""
     if signed_in:
         items = [("opnames", "/", "Mijn opnames"),
+                 ("apparaten", "/apparaten", "Mijn recorders"),
                  ("instellingen", "/instellingen", "Instellingen")]
         nav = "".join(
             f'<a href="{url}" class="{"active" if key == active else ""}">{label}</a>'
@@ -425,3 +426,104 @@ text-transform:uppercase;letter-spacing:.06em">
       onsubmit="return confirm('Hierna kan er niets meer naar OurMind tot je opnieuw inlogt.')">
 <button class="danger">OurMind loskoppelen</button></form></div>
 """, active="instellingen", who=who)
+
+
+# ---------------------------------------------------------------------------
+# my recorders: Wi-Fi and update status
+# ---------------------------------------------------------------------------
+
+_UPDATE_NL = {
+    "pending": "klaargezet, wordt geïnstalleerd bij de volgende synchronisatie",
+    "downloading": "wordt gedownload",
+    "installing": "wordt geïnstalleerd",
+    "deferred": "wacht tot Brian aan de lader staat (of de accu vol genoeg is)",
+    "failed": "mislukt; de beheerder is op de hoogte",
+}
+
+
+def render_devices(d: dict[str, Any], who: str) -> str:
+    from .util import local_time
+
+    notice = ""
+    if d.get("notice"):
+        notice = f'<div class="banner info">{_e(d["notice"])}</div>'
+    if d.get("error"):
+        notice = f'<div class="banner bad">{_e(d["error"])}</div>'
+    cards = []
+    for dev in d.get("devices") or []:
+        did = dev["device_id"]
+        w = dev["wifi"]
+        reported = w.get("reported")
+        if reported is None:
+            nets = ('<p class="sub">Brian heeft zijn netwerken nog niet doorgegeven. Dat '
+                    'gebeurt bij de volgende synchronisatie.</p>')
+        elif not reported:
+            nets = '<p class="sub">Geen netwerken bekend.</p>'
+        else:
+            items = []
+            for n in reported:
+                last = len(reported) == 1
+                warn = ("Dit is het laatste netwerk. Zonder netwerk moet Brian opnieuw "
+                        "ingesteld worden via zijn eigen hotspot. Doorgaan?" if last else
+                        f"{n} verwijderen van Brian?")
+                items.append(
+                    f'<li class="netrow"><span>{_e(n)}</span>'
+                    f'<form method="post" action="/apparaten/{_e(did)}/wifi/verwijderen" '
+                    f'onsubmit="return confirm({_e(_js(warn))})">'
+                    f'<input type="hidden" name="ssid" value="{_e(n)}">'
+                    f'<button class="danger">Verwijderen</button></form></li>')
+            nets = f'<ul class="plain nets">{"".join(items)}</ul>'
+            if len(reported) >= int(w.get("max_networks") or 8):
+                nets += ('<p class="sub"><b>Brian is vol.</b> Verwijder eerst een netwerk; '
+                         'een nieuw netwerk blijft anders wachten.</p>')
+        pend = "".join(
+            f'<li class="netrow"><span><span class="chip info">'
+            f'{"wordt toegevoegd" if p["op"] == "add" else "wordt verwijderd"}</span> '
+            f'{_e(p["ssid"])}</span>'
+            f'<form method="post" action="/apparaten/{_e(did)}/wifi/{int(p["id"])}/annuleren">'
+            f'<button>Annuleren</button></form></li>'
+            for p in w.get("pending") or [])
+        pend_html = (f'<h3>Onderweg naar Brian</h3><ul class="plain nets">{pend}</ul>'
+                     f'<p class="sub">Brian haalt dit op bij de volgende synchronisatie, '
+                     f'bijvoorbeeld als hij op de lader staat.</p>' if pend else "")
+        upd = dev.get("update")
+        upd_html = ""
+        if upd and upd.get("state") in _UPDATE_NL:
+            upd_html = (f'<p class="sub">Software-update {_e(upd["version"])}: '
+                        f'{_e(_UPDATE_NL[upd["state"]])}.</p>')
+        battery = dev.get("battery_percent")
+        seen = local_time(dev.get("last_seen_at")) if dev.get("last_seen_at") else "nog nooit"
+        cards.append(f"""<div class="panel">
+<h2 style="margin-top:0">{_e(dev.get('display_name') or did)}</h2>
+<p class="sub">Laatst gezien: {_e(seen)}
+{(' · accu ' + _e(battery) + '%') if battery is not None else ''}
+{(' · versie ' + _e(dev['software_version'])) if dev.get('software_version') else ''}</p>
+{upd_html}
+<h3>Wi-Fi-netwerken</h3>
+{nets}{pend_html}
+<form method="post" action="/apparaten/{_e(did)}/wifi" class="addnet" autocomplete="off">
+<div><label>Netwerknaam</label><input name="ssid" required maxlength="32"></div>
+<div><label>Wachtwoord</label><input name="password" type="password"
+ autocomplete="new-password" maxlength="63"></div>
+<div><button>Toevoegen</button></div></form>
+<p class="sub" style="margin-top:8px">Het wachtwoord gaat versleuteld naar Brian en wordt
+daarna van de server gewist. Brian onthoudt maximaal {int(w.get('max_networks') or 8)}
+netwerken.</p></div>""")
+    body = "".join(cards) or ('<div class="panel"><p class="sub">Er is nog geen recorder aan '
+                              'je gekoppeld. Vraag de beheerder om Brian te koppelen.</p></div>')
+    return layout("Mijn recorders", f"""
+<style>.nets{{display:flex;flex-direction:column;gap:8px}}
+.netrow{{display:flex;align-items:center;justify-content:space-between;gap:12px;
+border:1px solid var(--line);border-radius:9px;padding:8px 12px}}
+.netrow form{{margin:0}}
+.addnet{{display:flex;gap:10px;flex-wrap:wrap;align-items:flex-end;margin-top:14px}}
+.addnet>div{{flex:1;min-width:160px}}.addnet>div:last-child{{flex:0 0 auto;min-width:0}}</style>
+<div class="hero"><div><h1>Mijn recorders</h1>
+<p class="sub">Beheer de Wi-Fi-netwerken waarmee Brian zijn opnames verstuurt.</p></div></div>
+{notice}{body}""", active="apparaten", who=who)
+
+
+def _js(value: str) -> str:
+    import json
+
+    return json.dumps(value, ensure_ascii=False)

@@ -17,13 +17,14 @@ from typing import Any
 from fastapi import FastAPI, Form, Request, Response
 from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse
 
-from . import audit, db, processing, routing, sessions, userauth, users
+from . import audit, db, fleet, processing, routing, sessions, userauth, users
 from .bootstrap import initialise
 from .config import settings
 from .errors import ApiError, api_error_handler, unhandled_handler
 from .providers import ProviderError
 from .providers import get as get_provider
-from .user_html import render_login, render_recording, render_recordings, render_settings
+from .user_html import (render_devices, render_login, render_recording, render_recordings,
+                        render_settings)
 
 
 @asynccontextmanager
@@ -248,6 +249,66 @@ def create_user_app() -> FastAPI:
         audit.log("user_login", "ourmind_disconnected", "success",
                   identity=user["email"], detail={"user_id": user["user_id"]})
         return RedirectResponse("/instellingen", status_code=303)
+
+    # -- my recorders: Wi-Fi ---------------------------------------------
+    def _my_device(user: dict[str, Any], device_id: str) -> dict[str, Any]:
+        # The ownership check IS the query: a device of someone else is simply
+        # not found, exactly like a recording of someone else.
+        row = db.query_one("SELECT * FROM devices WHERE device_id = ? AND user_id = ?",
+                           (device_id, user["user_id"]))
+        if row is None:
+            raise ApiError("INVALID_REQUEST", "Onbekende recorder", status_code=404)
+        return dict(row)
+
+    def _devices_page(user: dict[str, Any], notice: str = "", error: str = "") -> str:
+        devices = []
+        for dev in users.devices_of(user["user_id"]):
+            devices.append({
+                "device_id": dev["device_id"], "display_name": dev["display_name"],
+                "last_seen_at": dev["last_seen_at"],
+                "battery_percent": dev["battery_percent"],
+                "software_version": dev["software_version"],
+                "wifi": fleet.wifi_view(dev),
+                "update": fleet.update_of(dev["device_id"]),
+            })
+        return render_devices({"devices": devices, "notice": notice, "error": error},
+                              _who(user))
+
+    @app.get("/apparaten", response_class=HTMLResponse)
+    async def devices_page(request: Request, klaar: str = "") -> Response:
+        user = userauth.require_user(request)
+        notice = ("Klaargezet. Brian verwerkt het bij de volgende synchronisatie."
+                  if klaar else "")
+        return HTMLResponse(_devices_page(user, notice=notice))
+
+    @app.post("/apparaten/{device_id}/wifi")
+    async def wifi_add(device_id: str, request: Request,
+                       ssid: str = Form(""), password: str = Form("")) -> Response:
+        user = userauth.require_user(request)
+        _my_device(user, device_id)
+        try:
+            fleet.queue_wifi(device_id, "add", ssid, password, actor=user["email"])
+        except ApiError as exc:
+            return HTMLResponse(_devices_page(user, error=exc.message), status_code=400)
+        return RedirectResponse("/apparaten?klaar=1", status_code=303)
+
+    @app.post("/apparaten/{device_id}/wifi/verwijderen")
+    async def wifi_remove(device_id: str, request: Request,
+                          ssid: str = Form("")) -> Response:
+        user = userauth.require_user(request)
+        _my_device(user, device_id)
+        try:
+            fleet.queue_wifi(device_id, "remove", ssid, actor=user["email"])
+        except ApiError as exc:
+            return HTMLResponse(_devices_page(user, error=exc.message), status_code=400)
+        return RedirectResponse("/apparaten?klaar=1", status_code=303)
+
+    @app.post("/apparaten/{device_id}/wifi/{op_id}/annuleren")
+    async def wifi_cancel(device_id: str, op_id: int, request: Request) -> Response:
+        user = userauth.require_user(request)
+        _my_device(user, device_id)
+        fleet.cancel_wifi(device_id, op_id, actor=user["email"])
+        return RedirectResponse("/apparaten", status_code=303)
 
     @app.get("/api/stand")
     async def stand(request: Request, opname: str = "") -> Response:

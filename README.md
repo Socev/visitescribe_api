@@ -77,6 +77,9 @@ Base: `https://scribe.primumnonnocere.olares.com/v1`
 | `GET`  | `/device/config` | device configuration |
 | `POST` | `/device/heartbeat` | device health |
 | `GET`  | `/server/public-key` | the active RSA public key, for provisioning |
+| `POST` | `/device/enroll` | a new recorder announces itself (no credentials) |
+| `GET`  | `/device/firmware/{release_id}` | download a firmware image set out for this device |
+| `POST` | `/device/firmware/report` | update progress: deferred / installing / failed |
 
 Plus `/healthz`, `/readyz` and OpenAPI at `/v1/docs`.
 
@@ -340,6 +343,32 @@ socket does not work yet.** `OurMindProvider` is still in that state — it has
 no such test, because it cannot be exercised without an integration token.
 Treat its first real call as untested code.
 
+
+## Fleet: joining, Wi-Fi and firmware over the air
+
+A new recorder enrols itself and shows a six-digit pairing code; it can upload
+nothing until an admin links it with that code to a user (**Devices → Nieuwe
+recorders**). Users manage their recorder's Wi-Fi networks on the user site
+(**Mijn recorders**); changes travel in the config response and the password
+is wiped from the server as soon as the recorder confirms it. Admins upload
+firmware images (**Firmware**) and set them out per device; the recorder
+installs only when idle with enough battery and a charger (or a nearly full
+battery), verifies the SHA-256 first, and the update counts as installed only
+when the recorder returns running the new version. Details and the wire format:
+[`docs/RECORDER.md`](docs/RECORDER.md#joining-wi-fi-and-updates-over-the-air-since-190).
+
+| Variable | Default | Meaning |
+|---|---|---|
+| `VS_SELF_ENROLMENT` | `true` | recorders may enrol themselves (as pending) |
+| `VS_MAX_PENDING_DEVICES` | `25` | how many may wait for linking at once |
+| `VS_PAIRING_CODE_HOURS` | `72` | lifetime of a pairing code (renewed automatically) |
+| `VS_ENROL_RATE_PER_MINUTE` | `6` | enrolment attempts per source address |
+| `VS_OTA_MIN_BATTERY_CHARGING` | `20` | battery needed to update on a charger (never below 20) |
+| `VS_OTA_MIN_BATTERY_UNPLUGGED` | `80` | battery needed to update without a charger |
+| `VS_OTA_MAX_ATTEMPTS` | `3` | downloads before a failing update stops being offered |
+| `VS_MAX_FIRMWARE_BYTES` | `6291456` | largest accepted image (one OTA slot is 6.25 MiB) |
+
+---
 
 ## Admin interface
 

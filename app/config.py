@@ -108,6 +108,23 @@ class Settings:
     # nothing, which is exactly the kind of trap this codebase keeps finding.
     auto_process: bool = field(default_factory=lambda: _b("VS_AUTO_PROCESS", True))
 
+    # --- fleet: self-enrolment, Wi-Fi and firmware over the air ---------------
+    # A recorder may announce itself (POST /v1/device/enroll). It then waits,
+    # unable to upload, until an admin links it with the code on its screen.
+    self_enrolment: bool = field(default_factory=lambda: _b("VS_SELF_ENROLMENT", True))
+    max_pending_devices: int = field(default_factory=lambda: _i("VS_MAX_PENDING_DEVICES", 25))
+    pairing_code_hours: int = field(default_factory=lambda: _i("VS_PAIRING_CODE_HOURS", 72))
+    enrol_rate_per_minute: int = field(default_factory=lambda: _i("VS_ENROL_RATE_PER_MINUTE", 6))
+    # When a recorder may install an update. The recorder enforces these; the
+    # server only advertises them, and the firmware never goes below 20 %.
+    ota_min_battery_charging: int = field(
+        default_factory=lambda: _i("VS_OTA_MIN_BATTERY_CHARGING", 20))
+    ota_min_battery_unplugged: int = field(
+        default_factory=lambda: _i("VS_OTA_MIN_BATTERY_UNPLUGGED", 80))
+    ota_max_attempts: int = field(default_factory=lambda: _i("VS_OTA_MAX_ATTEMPTS", 3))
+    max_firmware_bytes: int = field(
+        default_factory=lambda: _i("VS_MAX_FIRMWARE_BYTES", 6 * 1024 * 1024))
+
     public_base_url: str = field(default_factory=lambda: _s("VS_PUBLIC_BASE_URL", ""))
     log_level: str = field(default_factory=lambda: _s("VS_LOG_LEVEL", "info"))
 
@@ -118,6 +135,10 @@ class Settings:
     @property
     def blob_dir(self) -> Path:
         return self.data_dir / "blobs"
+
+    @property
+    def firmware_dir(self) -> Path:
+        return self.data_dir / "firmware"
 
     @property
     def keys_dir(self) -> Path:

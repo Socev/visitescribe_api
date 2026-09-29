@@ -113,8 +113,8 @@ def devices_of(user_id: str) -> list[dict[str, Any]]:
 
 def unbound_devices() -> list[dict[str, Any]]:
     return [dict(r) for r in db.query(
-        "SELECT * FROM devices WHERE user_id IS NULL OR user_id = '' "
-        "ORDER BY device_id")]
+        "SELECT * FROM devices WHERE (user_id IS NULL OR user_id = '') "
+        "AND IFNULL(enrol_state, '') != 'pending' ORDER BY device_id")]
 
 
 def bind_device(device_id: str, user_id: str | None, *, actor: str = "admin") -> None:

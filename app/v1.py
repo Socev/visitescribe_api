@@ -9,12 +9,15 @@ from fastapi import APIRouter, Request, Response
 from fastapi.responses import JSONResponse
 from pydantic import ValidationError
 
-from . import (audit, crypto, db, flacinfo, idempotency, processing, ratelimit,
+from fastapi.responses import FileResponse
+
+from . import (audit, crypto, db, fleet, flacinfo, idempotency, processing, ratelimit,
                sessions, storage, users)
-from .auth import DeviceIdentity, authenticate
+from .auth import DeviceIdentity, authenticate, client_ip
 from .config import SUPPORTED_MODES, settings
 from .errors import ApiError
-from .models import CompleteRequest, EventsRequest, HeartbeatRequest, SessionManifest
+from .models import (CompleteRequest, EnrollRequest, EventsRequest, FirmwareReport,
+                     HeartbeatRequest, SessionManifest)
 from .util import (
     canonical_hash,
     b64decode_strict,
@@ -38,6 +41,14 @@ MAX_SEQUENCE = 2**31 - 1
 
 def _require_uploads_enabled(ident: DeviceIdentity) -> None:
     """An administrator can pause a device without disabling it entirely."""
+    if fleet.is_pending(ident.row):
+        audit.log("auth", "device_pending", "failure", device_id=ident.device_id,
+                  source_ip=ident.source_ip)
+        raise ApiError(
+            "DEVICE_PENDING",
+            "This device has enrolled but is not linked yet; an administrator must "
+            "enter its pairing code",
+        )
     if not ident.row.get("upload_enabled", 1):
         audit.log("auth", "uploads_paused", "failure", device_id=ident.device_id,
                   source_ip=ident.source_ip)
@@ -925,6 +936,15 @@ async def device_config(request: Request) -> Response:
             continue
         config[key] = value
     config["encryption_required"] = True
+    # Fleet management: enrolment state, Wi-Fi changes, firmware update.
+    config["enrolment"] = fleet.enrolment_block(ident.row)
+    if fleet.is_pending(ident.row):
+        config["upload_enabled"] = False
+    config["wifi_ops"] = fleet.wifi_ops_for_device(ident.device_id)
+    config["wifi_ops_applied"] = int(ident.row.get("wifi_ops_applied") or 0)
+    update = fleet.update_block(ident.row)
+    if update:
+        config["firmware_update"] = update
     key = crypto.active_key()
     if key:
         config["server_key"] = {
@@ -965,6 +985,7 @@ async def device_heartbeat(request: Request) -> Response:
             now_iso(), ident.device_id,
         ),
     )
+    fleet.record_heartbeat(ident.device_id, beat)
     audit.log("device", "heartbeat", "success", device_id=ident.device_id,
               auth_method=ident.auth_method, source_ip=ident.source_ip,
               detail={"software_version": beat.software_version,
@@ -978,9 +999,70 @@ async def device_heartbeat(request: Request) -> Response:
             "accepted": True,
             "server_time": now_iso(),
             "config_version": int(ident.row.get("config_version") or 1),
-            "upload_enabled": bool(ident.row.get("upload_enabled", 1)),
+            "upload_enabled": bool(ident.row.get("upload_enabled", 1))
+            and not fleet.is_pending(ident.row),
+            "enrolment_state": "pending" if fleet.is_pending(ident.row) else "active",
         },
     )
+
+
+# ---------------------------------------------------------------------------
+# Fleet: self-enrolment and firmware over the air (see app/fleet.py)
+# ---------------------------------------------------------------------------
+
+@router.post("/device/enroll")
+async def device_enroll(request: Request) -> Response:
+    """A new recorder announces itself. No credentials: it has none yet.
+
+    Bounded per source address and by the number of devices waiting; what it
+    buys a caller is a pending device that can upload nothing until an admin
+    types in the code shown on that recorder's own screen.
+    """
+    ip = client_ip(request)
+    if not ratelimit.allow(f"enrol:{ip}", settings.enrol_rate_per_minute,
+                           max(1, settings.enrol_rate_per_minute)):
+        audit.log("device", "self_enrol_rate_limited", "failure", source_ip=ip)
+        raise ApiError("RATE_LIMITED", "Too many enrolment attempts from this address")
+    payload = await _json_body(request, limit=16 * 1024)
+    try:
+        req = EnrollRequest.model_validate(payload)
+    except ValidationError as exc:
+        raise ApiError("INVALID_REQUEST", "Enrolment payload failed validation",
+                       extra={"details": _short_errors(exc)}) from exc
+    header_id = (request.headers.get("x-device-id") or "").strip()
+    if header_id and header_id != req.device_id:
+        raise ApiError("INVALID_DEVICE", "X-Device-ID does not match device_id")
+    result = fleet.enroll(req.device_id, hardware=req.hardware,
+                          software_version=req.software_version, source_ip=ip)
+    return JSONResponse(status_code=201, content=result)
+
+
+@router.get("/device/firmware/{release_id}")
+async def device_firmware(release_id: str, request: Request) -> Response:
+    ident = _identity(request)
+    release = fleet.firmware_for_download(ident.device_id, release_id)
+    audit.log("firmware", "download", "success", device_id=ident.device_id,
+              auth_method=ident.auth_method, source_ip=ident.source_ip,
+              detail={"release_id": release_id, "version": release["version"]})
+    return FileResponse(
+        release["blob_path"], media_type="application/octet-stream",
+        headers={"X-Firmware-SHA256": release["sha256"],
+                 "X-Firmware-Version": release["version"],
+                 "Cache-Control": "no-store"})
+
+
+@router.post("/device/firmware/report")
+async def device_firmware_report(request: Request) -> Response:
+    ident = _identity(request)
+    payload = await _json_body(request, limit=16 * 1024)
+    try:
+        report = FirmwareReport.model_validate(payload)
+    except ValidationError as exc:
+        raise ApiError("INVALID_REQUEST", "Report payload failed validation",
+                       extra={"details": _short_errors(exc)}) from exc
+    fleet.report_update(ident.device_id, report.release_id, report.state,
+                        report.detail or "")
+    return JSONResponse(status_code=200, content={"accepted": True})
 
 
 @router.get("/server/public-key")

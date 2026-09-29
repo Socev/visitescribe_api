@@ -92,3 +92,22 @@ class HeartbeatRequest(BaseModel):
     storage_free_bytes: int | None = None
     last_recording_at: str | None = None
     network_state: str | None = None
+    # Fleet management (all optional; an older recorder simply omits them).
+    wifi_networks: list[str] | None = None      # SSIDs only, never passwords
+    wifi_ops_applied: int | None = None         # highest Wi-Fi op id applied
+    charging: bool | None = None
+    hardware: dict[str, Any] | None = None
+
+
+class EnrollRequest(BaseModel):
+    model_config = _LOOSE
+    device_id: str
+    software_version: str | None = None
+    hardware: dict[str, Any] | None = None
+
+
+class FirmwareReport(BaseModel):
+    model_config = _LOOSE
+    release_id: str
+    state: str
+    detail: str | None = None

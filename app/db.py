@@ -347,6 +347,51 @@ CREATE TABLE IF NOT EXISTS admin_sessions (
     label      TEXT NOT NULL DEFAULT ''
 );
 
+-- Fleet management: self-enrolment, Wi-Fi delivered to the recorder and
+-- firmware updates over the air. See app/fleet.py.
+
+-- A Wi-Fi change waiting for the recorder. The password is sealed while the
+-- change is in flight and blanked as soon as the recorder confirms it, so
+-- the server does not keep a standing list of practice Wi-Fi passwords.
+CREATE TABLE IF NOT EXISTS device_wifi_ops (
+    id           INTEGER PRIMARY KEY AUTOINCREMENT,
+    device_id    TEXT NOT NULL,
+    op           TEXT NOT NULL,              -- add | remove
+    ssid         TEXT NOT NULL,
+    secret       TEXT NOT NULL DEFAULT '',   -- sealed password, '' once delivered
+    created_at   TEXT NOT NULL,
+    created_by   TEXT NOT NULL DEFAULT '',
+    applied_at   TEXT,
+    cancelled_at TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_wifi_ops_device ON device_wifi_ops(device_id, id);
+
+CREATE TABLE IF NOT EXISTS firmware_releases (
+    release_id  TEXT PRIMARY KEY,
+    version     TEXT NOT NULL,
+    board       TEXT NOT NULL DEFAULT '',
+    sha256      TEXT NOT NULL,
+    size        INTEGER NOT NULL,
+    filename    TEXT NOT NULL DEFAULT '',
+    blob_path   TEXT NOT NULL,
+    notes       TEXT NOT NULL DEFAULT '',
+    created_at  TEXT NOT NULL,
+    created_by  TEXT NOT NULL DEFAULT ''
+);
+
+-- At most one update is set out per device at a time.
+CREATE TABLE IF NOT EXISTS device_updates (
+    device_id     TEXT PRIMARY KEY,
+    release_id    TEXT NOT NULL,
+    state         TEXT NOT NULL,   -- pending | downloading | installing | deferred
+                                   -- | installed | failed | cancelled
+    attempts      INTEGER NOT NULL DEFAULT 0,
+    detail        TEXT NOT NULL DEFAULT '',
+    requested_at  TEXT NOT NULL,
+    requested_by  TEXT NOT NULL DEFAULT '',
+    updated_at    TEXT NOT NULL
+);
+
 CREATE TABLE IF NOT EXISTS meta (
     key   TEXT PRIMARY KEY,
     value TEXT NOT NULL
@@ -405,6 +450,14 @@ def get_conn() -> sqlite3.Connection:
 # with real recordings in it, so the schema has to grow without a rebuild.
 ADDED_COLUMNS: tuple[tuple[str, str, str], ...] = (
     ("devices", "user_id", "TEXT"),
+    # NULL = registered by hand before self-enrolment existed (active).
+    ("devices", "enrol_state", "TEXT"),
+    ("devices", "pairing_code", "TEXT"),          # sealed, only while pending
+    ("devices", "pairing_expires_at", "TEXT"),
+    ("devices", "hardware_json", "TEXT NOT NULL DEFAULT '{}'"),
+    ("devices", "wifi_networks_json", "TEXT"),    # SSIDs as reported, no passwords
+    ("devices", "wifi_ops_applied", "INTEGER NOT NULL DEFAULT 0"),
+    ("devices", "charging", "INTEGER"),
 )
 
 

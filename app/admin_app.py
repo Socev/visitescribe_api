@@ -16,7 +16,9 @@ from contextlib import asynccontextmanager
 from fastapi import FastAPI, Request, Response
 from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse, StreamingResponse
 
-from . import (__version__, adminauth, audio, audit, crypto, db, flacinfo,
+from urllib.parse import unquote
+
+from . import (__version__, adminauth, audio, audit, crypto, db, fleet, flacinfo,
                pricing, processing, routing, sessions, storage, users)
 from .providers import credentials as provider_credentials
 from .providers import get as get_provider
@@ -26,6 +28,7 @@ from .admin_html import (
     render_dashboard,
     render_device_detail,
     render_devices,
+    render_firmware,
     render_keys,
     render_login,
     render_session_detail,
@@ -200,6 +203,13 @@ def create_admin_app() -> FastAPI:
         if data is None:
             return HTMLResponse("<h1>Unknown device</h1>", status_code=404)
         return HTMLResponse(render_device_detail(data, who))
+
+    @app.get("/admin/firmware", response_class=HTMLResponse, include_in_schema=False)
+    async def firmware_page(request: Request):  # noqa: ANN202
+        who = html_guard(request)
+        if isinstance(who, RedirectResponse):
+            return who
+        return HTMLResponse(render_firmware(_firmware_data(), who))
 
     @app.get("/admin/keys", response_class=HTMLResponse, include_in_schema=False)
     async def keys_page(request: Request):  # noqa: ANN202
@@ -593,6 +603,81 @@ def create_admin_app() -> FastAPI:
                   identity=who, detail={"minutes": minutes, "expires_at": expires})
         return JSONResponse({"device_id": device_id, "expires_at": expires})
 
+    # ------------------------------------------------------------- fleet
+    @app.post("/admin/api/pairing", include_in_schema=False)
+    async def api_link_device(request: Request) -> JSONResponse:  # noqa: ANN202
+        who = guard(request)
+        body = await _body(request)
+        device = fleet.link(str(body.get("code") or ""),
+                            user_id=str(body.get("user_id") or "") or None,
+                            display_name=str(body.get("display_name") or ""), actor=who)
+        return JSONResponse({"device_id": device["device_id"]})
+
+    @app.post("/admin/api/devices/{device_id}/reenrol", include_in_schema=False)
+    async def api_reenrol(device_id: str, request: Request) -> JSONResponse:  # noqa: ANN202
+        who = guard(request)
+        body = await _body(request)
+        expires = fleet.allow_reenrol(device_id, minutes=int(body.get("minutes") or 30),
+                                      actor=who)
+        return JSONResponse({"device_id": device_id, "expires_at": expires})
+
+    @app.post("/admin/api/devices/{device_id}/wifi", include_in_schema=False)
+    async def api_device_wifi(device_id: str, request: Request) -> JSONResponse:  # noqa: ANN202
+        who = guard(request)
+        body = await _body(request)
+        if body.get("cancel"):
+            fleet.cancel_wifi(device_id, int(body["cancel"]), actor=who)
+        else:
+            fleet.queue_wifi(device_id, str(body.get("op") or "add"),
+                             str(body.get("ssid") or ""), str(body.get("password") or ""),
+                             actor=who)
+        return JSONResponse(fleet.wifi_view(fleet._device(device_id)))
+
+    @app.post("/admin/api/devices/{device_id}/firmware", include_in_schema=False)
+    async def api_device_firmware(device_id: str, request: Request) -> JSONResponse:  # noqa: ANN202
+        who = guard(request)
+        body = await _body(request)
+        if body.get("cancel"):
+            fleet.cancel_update(device_id, actor=who)
+            return JSONResponse({"update": fleet.update_of(device_id)})
+        return JSONResponse({"update": fleet.assign(
+            device_id, str(body.get("release_id") or ""), actor=who)})
+
+    @app.post("/admin/api/firmware", include_in_schema=False)
+    async def api_upload_firmware(request: Request) -> JSONResponse:  # noqa: ANN202
+        who = guard(request)
+        cap = settings.max_firmware_bytes
+        declared = request.headers.get("content-length")
+        if declared and declared.isdigit() and int(declared) > cap:
+            raise ApiError("PAYLOAD_TOO_LARGE", f"Firmware groter dan {cap} bytes.")
+        data = bytearray()
+        async for piece in request.stream():
+            data.extend(piece)
+            if len(data) > cap:
+                raise ApiError("PAYLOAD_TOO_LARGE", f"Firmware groter dan {cap} bytes.")
+        release = fleet.add_release(
+            bytes(data),
+            filename=unquote(request.headers.get("x-filename") or ""),
+            version=unquote(request.headers.get("x-version") or ""),
+            notes=unquote(request.headers.get("x-notes") or ""), actor=who)
+        return JSONResponse({"release": release}, status_code=201)
+
+    @app.post("/admin/api/firmware/{release_id}/assign", include_in_schema=False)
+    async def api_assign_firmware(release_id: str, request: Request) -> JSONResponse:  # noqa: ANN202
+        who = guard(request)
+        body = await _body(request)
+        ids = body.get("device_ids") or []
+        if not isinstance(ids, list) or not ids:
+            raise ApiError("INVALID_REQUEST", "Kies minstens één apparaat.")
+        done = [fleet.assign(str(d), release_id, actor=who)["device_id"] for d in ids]
+        return JSONResponse({"assigned": done})
+
+    @app.delete("/admin/api/firmware/{release_id}", include_in_schema=False)
+    async def api_delete_firmware(release_id: str, request: Request) -> JSONResponse:  # noqa: ANN202
+        who = guard(request)
+        fleet.delete_release(release_id, actor=who)
+        return JSONResponse({"ok": True})
+
     @app.delete("/admin/api/devices/{device_id}", include_in_schema=False)
     async def api_delete_device(device_id: str, request: Request) -> JSONResponse:  # noqa: ANN202
         who = guard(request)
@@ -602,6 +687,8 @@ def create_admin_app() -> FastAPI:
             raise ApiError("INVALID_REQUEST",
                            "Device still owns sessions; disable it instead of deleting")
         db.execute("DELETE FROM devices WHERE device_id = ?", (device_id,))
+        db.execute("DELETE FROM device_wifi_ops WHERE device_id = ?", (device_id,))
+        db.execute("DELETE FROM device_updates WHERE device_id = ?", (device_id,))
         audit.log("device", "deleted", "success", device_id=device_id, identity=who)
         return JSONResponse({"ok": True})
 
@@ -856,9 +943,14 @@ def _users_data() -> dict[str, Any]:
 
 def _devices_data() -> dict[str, Any]:
     devices = []
-    for r in db.query("SELECT * FROM devices ORDER BY device_id"):
+    for r in db.query("SELECT * FROM devices WHERE IFNULL(enrol_state, '') != 'pending' "
+                      "ORDER BY device_id"):
         item = dict(r)
         item["has_token"] = bool(item.pop("token_hash", None))
+        item.pop("pairing_code", None)
+        upd = fleet.update_of(item["device_id"])
+        item["update_state"] = upd["state"] if upd else ""
+        item["update_version"] = upd["version"] if upd else ""
         counts = db.query_one(
             "SELECT COUNT(*) AS n, SUM(CASE WHEN ingest_confirmed = 1 THEN 1 ELSE 0 END) AS ok "
             "FROM sessions WHERE device_id = ?", (item["device_id"],))
@@ -871,7 +963,26 @@ def _devices_data() -> dict[str, Any]:
     windows = {r["device_id"]: r["expires_at"] for r in db.query(
         "SELECT * FROM enrolment_windows")}
     return {"devices": devices, "enrolment_windows": windows,
-            "require_device_auth": settings.require_device_auth}
+            "require_device_auth": settings.require_device_auth,
+            "pending": fleet.pending_devices(),
+            "users": [{"user_id": u["user_id"], "email": u["email"],
+                       "display_name": u["display_name"]} for u in users.listing()],
+            "self_enrolment": settings.self_enrolment}
+
+
+def _firmware_data() -> dict[str, Any]:
+    devices = []
+    for r in db.query("SELECT d.device_id, d.display_name, d.software_version, "
+                      "d.battery_percent, d.last_seen_at, d.charging FROM devices d "
+                      "WHERE IFNULL(d.enrol_state, '') != 'pending' ORDER BY d.device_id"):
+        item = dict(r)
+        upd = fleet.update_of(item["device_id"])
+        item["update"] = upd
+        devices.append(item)
+    return {"releases": fleet.releases(), "devices": devices,
+            "policy": {"charging": max(20, settings.ota_min_battery_charging),
+                       "unplugged": max(20, settings.ota_min_battery_unplugged)},
+            "max_bytes": settings.max_firmware_bytes}
 
 
 def _device_detail(device_id: str) -> dict[str, Any] | None:
@@ -880,6 +991,7 @@ def _device_detail(device_id: str) -> dict[str, Any] | None:
         return None
     device = dict(row)
     device["has_token"] = bool(device.pop("token_hash", None))
+    device.pop("pairing_code", None)
     try:
         device["config"] = json.loads(device.pop("config_json") or "{}")
     except (ValueError, TypeError):
@@ -893,6 +1005,10 @@ def _device_detail(device_id: str) -> dict[str, Any] | None:
             "SELECT * FROM sessions WHERE device_id = ? ORDER BY created_at DESC LIMIT 50",
             (device_id,))],
         "audit": audit.recent(limit=100, device_id=device_id),
+        "wifi": fleet.wifi_view(dict(row)),
+        "update": fleet.update_of(device_id),
+        "releases": [{"release_id": r["release_id"], "version": r["version"],
+                      "created_at": r["created_at"]} for r in fleet.releases()],
     }
 
 

@@ -210,3 +210,90 @@ own spelling as its display name, treated as carrying patient audio, and shows
 up in every user's settings, where it can be given an automatic route and
 template like any other. Its display name heads the report title at the
 provider: `MDO - 25-09-26 - 12:00`.
+
+## Joining, Wi-Fi and updates over the air (since 1.9.0)
+
+A recorder no longer needs anything compiled in except the server URL. Its
+identity, token and Wi-Fi networks live in its own flash (NVS), so one firmware
+image can go to every recorder.
+
+### 1. Enrol
+
+```
+POST /v1/device/enroll            (no credentials)
+{ "device_id": "brian-a1b2c3d4e5f6", "software_version": "0.8.0",
+  "hardware": { "mac": "a1:b2:c3:d4:e5:f6", "board": "cores3-lite" } }
+
+201 { "device_id": "...", "token": "<shown once>",
+      "enrolment": { "state": "pending", "pairing_code": "482913",
+                     "pairing_expires_at": "..." } }
+```
+
+Store the token; send it as `Authorization: Bearer` from then on. A pending
+recorder authenticates normally but every upload is refused with
+`403 DEVICE_PENDING`. Show the pairing code on the screen; an admin types it
+in under **Devices → Nieuwe recorders** and picks the user. `GET /v1/device/config`
+returns the code again on every read (renewed when it expires), and returns
+`"enrolment": {"state": "active", "linked": true}` once linked.
+
+| Situation | Result |
+|---|---|
+| unknown ID | created pending, with a code |
+| unknown ID, admin opened an enrolment window | created active, no code |
+| known, still pending | new token and new code (the recorder lost its token) |
+| known, active | `409 DEVICE_EXISTS`, unless an admin clicked *Opnieuw laten aanmelden*; then re-keyed, owner and history kept |
+
+Limits: `VS_ENROL_RATE_PER_MINUTE` per source address, `VS_MAX_PENDING_DEVICES`
+waiting at once, `VS_SELF_ENROLMENT=false` switches it off.
+
+### 2. Every sync: heartbeat and config
+
+`POST /v1/device/heartbeat` now also takes
+
+```json
+{ "software_version": "0.8.0", "battery_percent": 64, "charging": true,
+  "wifi_networks": ["Praktijk", "Thuis"], "wifi_ops_applied": 17,
+  "hardware": { "mac": "...", "board": "cores3-lite" } }
+```
+
+`GET /v1/device/config` now also returns
+
+```json
+{ "enrolment": { "state": "active", "linked": true },
+  "wifi_ops_applied": 15,
+  "wifi_ops": [ { "id": 16, "op": "add", "ssid": "Praktijk", "password": "..." },
+                { "id": 17, "op": "remove", "ssid": "Oud" } ],
+  "firmware_update": { "release_id": "fw-…", "version": "0.8.1",
+                       "sha256": "…", "size": 1523456,
+                       "url": "/v1/device/firmware/fw-…",
+                       "min_battery_charging": 20, "min_battery_unplugged": 80 } }
+```
+
+**Wi-Fi ops** are applied in id order: `add` inserts or replaces that SSID,
+`remove` deletes it. Report the highest id applied as `wifi_ops_applied` in the
+next heartbeat; the server then blanks the password. SSIDs only are reported
+back, never passwords.
+
+**Firmware:** install only when not recording and either
+`battery ≥ min_battery_charging` while on a charger, or
+`battery ≥ min_battery_unplugged` without one. Never below 20 %, whatever the
+server says. Then:
+
+1. `GET url` (normal device auth) — the body is the image; `X-Firmware-SHA256`
+   repeats the hash.
+2. Stream it into the inactive OTA slot while hashing; compare SHA-256 and
+   size *before* marking the slot bootable. Mismatch → abort, report `failed`.
+3. `POST /v1/device/firmware/report {"release_id", "state", "detail"}` with
+   `deferred` (conditions not met), `installing` (about to reboot) or `failed`.
+4. Reboot. The update counts as **installed** only when a heartbeat arrives
+   with `software_version` equal to the release version.
+
+A release is offered until it is installed, cancelled, or has failed
+`VS_OTA_MAX_ATTEMPTS` downloads.
+
+### Firmware images
+
+Admin → **Firmware** accepts only an ESP32-S3 application image (magic `0xE9`,
+chip id 9). The version is read from the marker the VisiteScribe firmware
+embeds, `VSFW|version=<v>|board=<b>|`; the version the recorder reports in its
+heartbeat must be the same string.

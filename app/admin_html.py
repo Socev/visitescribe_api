@@ -154,6 +154,7 @@ def layout(title: str, body: str, active: str = "", who: str = "") -> str:
         ("sessions", "/admin/sessions", "Sessions"),
         ("devices", "/admin/devices", "Devices"),
         ("users", "/admin/users", "Gebruikers"),
+        ("firmware", "/admin/firmware", "Firmware"),
         ("costs", "/admin/costs", "Verwerking"),
         ("keys", "/admin/keys", "Keys"),
         ("audit", "/admin/audit", "Audit"),
@@ -572,9 +573,10 @@ def render_devices(d: dict[str, Any], who: str) -> str:
 <td class="right">{x['sessions']}</td>
 <td class="right">{x['sessions_confirmed']}</td>
 <td class="muted nowrap">{_e(_t(x['last_seen_at']) or '—')}</td>
-<td class="muted">{_e(x['last_auth_method'] or '—')}</td></tr>"""
+<td class="muted">{_e(x['last_auth_method'] or '—')}</td>
+<td>{_e(x.get('software_version') or '—')} {update_chip(x.get('update_state'), x.get('update_version'))}</td></tr>"""
         for x in d["devices"]
-    ) or '<tr><td colspan="7" class="muted">No devices yet.</td></tr>'
+    ) or '<tr><td colspan="8" class="muted">No devices yet.</td></tr>'
 
     windows = "".join(
         f'<li><span class="mono">{_e(k)}</span> until '
@@ -589,6 +591,7 @@ def render_devices(d: dict[str, Any], who: str) -> str:
     body = f"""<h1>Devices</h1>
 <p class="sub">A device must exist here before it can upload anything.</p>
 {windows_block}
+{_pending_panel(d)}
 <div class="panel"><h3 style="margin-top:0">Register a recorder</h3>
 <div class="row">
 <div><label>Device ID</label><input id="did" placeholder="visitescribe-001"></div>
@@ -613,7 +616,7 @@ itself on its next request. Unknown device IDs are never accepted otherwise.</p>
 <div class="narrow"><button onclick="openWindow()">Open window</button></div></div></div>
 <div class="panel"><div class="scroll"><table><thead><tr><th>Device</th><th>Status</th>
 <th>Auth</th><th class="right">Sessions</th><th class="right">Confirmed</th>
-<th>Last seen</th><th>Last method</th></tr></thead><tbody>{rows}</tbody></table></div></div>
+<th>Last seen</th><th>Last method</th><th>Firmware</th></tr></thead><tbody>{rows}</tbody></table></div></div>
 <script>
 async function createDevice(){{
   const id=document.getElementById('did').value.trim();
@@ -664,6 +667,8 @@ def render_device_detail(d: dict[str, Any], who: str) -> str:
 <dt>Last recording</dt><dd class="mono">{_e(x['last_recording_at'] or '—')}</dd>
 <dt>Network</dt><dd>{_e(x['network_state'] or '—')}</dd>
 <dt>Config version</dt><dd>{_e(x['config_version'])}</dd>
+<dt>Charging</dt><dd>{'—' if x.get('charging') is None else ('ja' if x.get('charging') else 'nee')}</dd>
+<dt>Hardware</dt><dd class="mono">{_e(x.get('hardware_json') or '{}')}</dd>
 </dl></div></div>
 <div class="panel"><h3 style="margin-top:0">Manage</h3><div class="row">
 <div class="narrow"><button onclick="upd({{enabled:{str(not x['enabled']).lower()}}})">
@@ -682,6 +687,9 @@ certificate (DER). Once pinned, every request from this device must present it.<
  value="{_e(x['cert_fingerprint'] or '')}" placeholder="64 hex characters"></div>
 <div class="narrow"><button onclick="pin()">Save fingerprint</button></div>
 <div class="narrow"><button onclick="unpin()">Remove pin</button></div></div></div>
+{_enrolment_panel(d)}
+{_wifi_panel(d)}
+{_device_firmware_panel(d)}
 <div class="panel"><h3 style="margin-top:0">Device configuration</h3>
 <p class="muted" style="margin-top:0">Returned by <code>GET /v1/device/config</code>.
 Security-critical values cannot be weakened from here.</p>
@@ -1222,3 +1230,252 @@ function bindDevice(deviceId, userId){{
 }}
 </script>"""
     return layout("Users", body, "users", who)
+
+
+# ---------------------------------------------------------------------------
+# fleet: enrolment, Wi-Fi, firmware
+# ---------------------------------------------------------------------------
+
+_UPDATE_LABEL = {
+    "pending": ("info", "klaargezet"),
+    "downloading": ("info", "downloaden"),
+    "installing": ("info", "installeren"),
+    "deferred": ("warn", "wacht op lader/accu"),
+    "installed": ("ok", "geïnstalleerd"),
+    "failed": ("bad", "mislukt"),
+    "cancelled": ("", "geannuleerd"),
+}
+
+
+def update_chip(state: str | None, version: str | None = None) -> str:
+    if not state:
+        return ""
+    kind, label = _UPDATE_LABEL.get(state, ("", state))
+    suffix = f" {version}" if version else ""
+    return f'<span class="chip {kind}">{_e(label + suffix)}</span>'
+
+
+def _user_options(users: list[dict[str, Any]], selected: str = "") -> str:
+    opts = ['<option value="">— nog niemand —</option>']
+    for u in users:
+        sel = " selected" if u["user_id"] == selected else ""
+        label = u.get("display_name") or u["email"]
+        opts.append(f'<option value="{_e(u["user_id"])}"{sel}>{_e(label)} '
+                    f'({_e(u["email"])})</option>')
+    return "".join(opts)
+
+
+def _pending_panel(d: dict[str, Any]) -> str:
+    pending = d.get("pending") or []
+    rows = "".join(
+        f"""<tr><td class="mono">{_e(p['device_id'])}</td>
+<td class="muted nowrap">{_e(_t(p['created_at']))}</td>
+<td class="muted nowrap">{_e(_t(p.get('last_seen_at')) or '—')}</td>
+<td class="mono muted">{_e(p.get('last_source_ip') or '—')}</td>
+<td>{_e(p.get('software_version') or '—')}</td>
+<td class="right"><button class="danger" onclick="rejectPending({_e(json.dumps(p['device_id']))})">
+Weigeren</button></td></tr>"""
+        for p in pending
+    ) or '<tr><td colspan="6" class="muted">Geen apparaten die wachten.</td></tr>'
+    closed = "" if d.get("self_enrolment", True) else (
+        '<div class="banner warn">Zelf aanmelden staat uit (<code>VS_SELF_ENROLMENT=false</code>);'
+        ' nieuwe recorders kunnen zich niet melden.</div>')
+    return f"""<div class="panel"><h3 style="margin-top:0">Nieuwe recorders — wachten op koppeling</h3>
+{closed}
+<p class="muted" style="margin-top:0">Een nieuwe Brian meldt zich zelf aan en toont een
+koppelcode van 6 cijfers op zijn scherm. Tot je hem hier koppelt kan hij niets uploaden.</p>
+<div class="row">
+<div class="narrow"><label>Koppelcode</label><input id="pcode" inputmode="numeric"
+ placeholder="123 456" style="width:130px" class="mono"></div>
+<div><label>Gebruiker</label><select id="puser">{_user_options(d.get('users') or [])}</select></div>
+<div><label>Naam</label><input id="pname" placeholder="Brian van dokter X"></div>
+<div class="narrow"><button class="primary" onclick="linkDevice()">Koppelen</button></div>
+</div>
+<div class="scroll" style="margin-top:12px"><table><thead><tr><th>Device</th><th>Aangemeld</th>
+<th>Laatst gezien</th><th>IP</th><th>Firmware</th><th></th></tr></thead>
+<tbody>{rows}</tbody></table></div></div>
+<script>
+async function linkDevice(){{
+  const code=document.getElementById('pcode').value.replace(/\\D/g,'');
+  if(code.length!==6){{toast('Een koppelcode heeft 6 cijfers','bad');return;}}
+  const r=await act('/admin/api/pairing',{{code:code,
+    user_id:document.getElementById('puser').value,
+    display_name:document.getElementById('pname').value}});
+  toast('Gekoppeld: '+r.device_id,'ok');
+  setTimeout(()=>location='/admin/devices/'+encodeURIComponent(r.device_id),700);
+}}
+async function rejectPending(id){{
+  if(!confirm('Aanmelding van '+id+' weigeren en verwijderen?'))return;
+  await act('/admin/api/devices/'+encodeURIComponent(id),{{}},'DELETE');
+  toast('Verwijderd','ok'); setTimeout(()=>location.reload(),600);
+}}
+</script>"""
+
+
+def _enrolment_panel(d: dict[str, Any]) -> str:
+    x = d["device"]
+    state = x.get("enrol_state") or "active (handmatig geregistreerd)"
+    return f"""<div class="panel"><h3 style="margin-top:0">Aanmelding</h3>
+<dl class="kv"><dt>Status</dt><dd>{_e(state)}</dd></dl>
+<p class="muted">Is Brian gewist of vervangen en moet hij zich opnieuw aanmelden met
+hetzelfde device-ID? Sta dat hier toe; hij krijgt dan een nieuw token en houdt zijn
+eigenaar, naam en opnames.</p>
+<button onclick="reenrol()">Opnieuw laten aanmelden (30 min)</button>
+<script>
+async function reenrol(){{
+  const r=await act(base+'/reenrol',{{minutes:30}});
+  toast('Aanmelden toegestaan tot '+r.expires_at,'ok');
+}}
+</script></div>"""
+
+
+def _wifi_panel(d: dict[str, Any]) -> str:
+    w = d.get("wifi") or {}
+    reported = w.get("reported")
+    if reported is None:
+        known = '<p class="muted">Nog niet gemeld door de recorder.</p>'
+    elif not reported:
+        known = '<p class="muted">Geen netwerken bekend.</p>'
+    else:
+        known = '<ul class="plain">' + "".join(
+            f'<li style="margin-bottom:6px"><span class="mono">{_e(n)}</span> '
+            f'<button onclick="wifiRemove({_e(json.dumps(n))})">Verwijderen</button></li>'
+            for n in reported) + "</ul>"
+    pending = "".join(
+        f'<li><span class="chip info">{"toevoegen" if p["op"] == "add" else "verwijderen"}</span> '
+        f'<span class="mono">{_e(p["ssid"])}</span> <span class="muted">door '
+        f'{_e(p["created_by"])}, {_e(_t(p["created_at"]))}</span> '
+        f'<button onclick="wifiCancel({int(p["id"])})">Annuleren</button></li>'
+        for p in w.get("pending") or [])
+    pending_html = (f'<h3>Onderweg naar de recorder</h3><ul class="plain">{pending}</ul>'
+                    if pending else "")
+    return f"""<div class="panel"><h3 style="margin-top:0">Wi-Fi</h3>
+<p class="muted" style="margin-top:0">Wijzigingen gaan mee bij de volgende synchronisatie.
+Wachtwoorden worden gewist zodra de recorder ze heeft. Maximaal {int(w.get('max_networks') or 8)}
+netwerken op het apparaat.</p>
+{known}{pending_html}
+<div class="row" style="margin-top:10px">
+<div><label>Netwerknaam (SSID)</label><input id="wssid"></div>
+<div><label>Wachtwoord</label><input id="wpass" type="password" autocomplete="new-password"></div>
+<div class="narrow"><button onclick="wifiAdd()">Toevoegen</button></div></div>
+<script>
+async function wifiAdd(){{ await act(base+'/wifi',{{op:'add',
+  ssid:document.getElementById('wssid').value,password:document.getElementById('wpass').value}});
+  toast('Klaargezet','ok'); setTimeout(()=>location.reload(),600); }}
+async function wifiRemove(ssid){{ if(!confirm('Netwerk '+ssid+' verwijderen van de recorder?'))return;
+  await act(base+'/wifi',{{op:'remove',ssid:ssid}}); toast('Klaargezet','ok');
+  setTimeout(()=>location.reload(),600); }}
+async function wifiCancel(id){{ await act(base+'/wifi',{{cancel:id}}); location.reload(); }}
+</script></div>"""
+
+
+def _device_firmware_panel(d: dict[str, Any]) -> str:
+    x = d["device"]
+    upd = d.get("update")
+    releases = d.get("releases") or []
+    opts = "".join(f'<option value="{_e(r["release_id"])}">{_e(r["version"])} '
+                   f'({_e(_t(r["created_at"]))})</option>' for r in releases)
+    status = '<p class="muted">Geen update klaargezet.</p>'
+    if upd:
+        status = (f'<dl class="kv"><dt>Klaargezet</dt><dd>{_e(upd["version"])} '
+                  f'{update_chip(upd["state"])}</dd>'
+                  f'<dt>Pogingen</dt><dd>{_e(upd["attempts"])}</dd>'
+                  f'<dt>Toelichting</dt><dd>{_e(upd["detail"] or "—")}</dd>'
+                  f'<dt>Bijgewerkt</dt><dd class="mono">{_e(_t(upd["updated_at"]))}</dd></dl>')
+    picker = (f'<div class="row" style="margin-top:10px"><div><label>Firmware</label>'
+              f'<select id="fwsel">{opts}</select></div>'
+              f'<div class="narrow"><button class="primary" onclick="fwAssign()">Klaarzetten</button></div>'
+              f'<div class="narrow"><button onclick="fwCancel()">Annuleren</button></div></div>'
+              if releases else
+              '<p class="muted">Nog geen firmware geüpload — zie <a href="/admin/firmware">Firmware</a>.</p>')
+    return f"""<div class="panel"><h3 style="margin-top:0">Firmware</h3>
+<dl class="kv"><dt>Draait nu</dt><dd>{_e(x.get('software_version') or '—')}</dd></dl>
+{status}{picker}
+<script>
+async function fwAssign(){{ await act(base+'/firmware',{{release_id:document.getElementById('fwsel').value}});
+  toast('Update klaargezet','ok'); setTimeout(()=>location.reload(),600); }}
+async function fwCancel(){{ await act(base+'/firmware',{{cancel:true}}); location.reload(); }}
+</script></div>"""
+
+
+def render_firmware(d: dict[str, Any], who: str) -> str:
+    rel_rows = "".join(
+        f"""<tr><td><b>{_e(r['version'])}</b><div class="muted">{_e(r['filename'])}</div></td>
+<td>{_e(r['board'] or '—')}</td><td class="right">{_e(human_bytes(r['size']))}</td>
+<td class="mono" title="{_e(r['sha256'])}">{_e(r['sha256'][:12])}…</td>
+<td class="muted nowrap">{_e(_t(r['created_at']))}</td>
+<td>{_e(r['notes'] or '')}</td>
+<td>{r['running']} draaien · {' '.join(update_chip(k) + f' {v}' for k, v in r['assignments'].items()) or '—'}</td>
+<td class="right"><button class="danger" onclick="fwDelete({_e(json.dumps(r['release_id']))})">
+Verwijderen</button></td></tr>"""
+        for r in d["releases"]
+    ) or '<tr><td colspan="8" class="muted">Nog geen firmware geüpload.</td></tr>'
+    rel_opts = "".join(f'<option value="{_e(r["release_id"])}">{_e(r["version"])}</option>'
+                       for r in d["releases"])
+    dev_rows = "".join(
+        f"""<tr><td><input type="checkbox" class="fwdev" value="{_e(x['device_id'])}"
+ style="width:auto"></td><td><a href="/admin/devices/{_e(x['device_id'])}">{_e(x['device_id'])}</a>
+<div class="muted">{_e(x['display_name'])}</div></td>
+<td>{_e(x['software_version'] or '—')}</td>
+<td>{_e(x['battery_percent'] if x['battery_percent'] is not None else '—')}%
+{'· lader' if x.get('charging') else ''}</td>
+<td class="muted nowrap">{_e(_t(x['last_seen_at']) or '—')}</td>
+<td>{update_chip(x['update']['state'], x['update']['version']) if x['update'] else '—'}
+{('<div class="muted">' + _e(x['update']['detail']) + '</div>') if x['update'] and x['update']['detail'] else ''}</td></tr>"""
+        for x in d["devices"]
+    ) or '<tr><td colspan="6" class="muted">Geen actieve apparaten.</td></tr>'
+    p = d["policy"]
+    body = f"""<h1>Firmware</h1>
+<p class="sub">Updates voor Brian over de lucht. De recorder installeert pas als hij niet
+opneemt en de accu boven {p['charging']}% zit terwijl hij aan de lader staat, of boven
+{p['unplugged']}% zonder lader. Hij controleert de SHA-256 vóór hij herstart; de update telt
+pas als geïnstalleerd wanneer hij terugkomt met de nieuwe versie.</p>
+<div class="banner warn">Zet een nieuwe versie eerst op één recorder. Een nieuwe versie die na
+installatie de server niet bereikt, gaat bij de volgende herstart vanzelf terug naar de vorige;
+een versie die wél verbinding maakt maar iets anders stuk heeft, is alleen via USB of een nieuwe
+update te herstellen.</div>
+<div class="panel"><h3 style="margin-top:0">Uploaden</h3>
+<p class="muted" style="margin-top:0">Het <code>firmware.bin</code> uit
+<code>.pio/build/cores3-lite-release/</code>. De server controleert dat het een
+ESP32-S3-applicatie is en leest de versie uit het image. Maximaal
+{_e(human_bytes(d['max_bytes']))}.</p>
+<div class="row"><div><label>Bestand</label><input type="file" id="fwfile" accept=".bin"></div>
+<div class="narrow"><label>Versie (optioneel)</label><input id="fwver" style="width:130px"
+ placeholder="uit image"></div>
+<div><label>Notities</label><input id="fwnotes" placeholder="Wat is er veranderd?"></div>
+<div class="narrow"><button class="primary" onclick="fwUpload()">Uploaden</button></div></div></div>
+<div class="panel"><div class="scroll"><table><thead><tr><th>Versie</th><th>Board</th>
+<th class="right">Grootte</th><th>SHA-256</th><th>Geüpload</th><th>Notities</th><th>Uitrol</th>
+<th></th></tr></thead><tbody>{rel_rows}</tbody></table></div></div>
+<h2>Klaarzetten</h2>
+<div class="panel"><div class="row"><div><label>Firmware</label><select id="fwrel">{rel_opts}</select></div>
+<div class="narrow"><button class="primary" onclick="fwAssignMany()">Klaarzetten voor selectie</button>
+</div></div>
+<div class="scroll" style="margin-top:12px"><table><thead><tr><th></th><th>Apparaat</th>
+<th>Draait</th><th>Accu</th><th>Laatst gezien</th><th>Update</th></tr></thead>
+<tbody>{dev_rows}</tbody></table></div></div>
+<script>
+async function fwUpload(){{
+  const f=document.getElementById('fwfile').files[0];
+  if(!f){{toast('Kies een bestand','bad');return;}}
+  try{{
+    const r=await fetch('/admin/api/firmware',{{method:'POST',body:f,headers:{{
+      'Content-Type':'application/octet-stream','X-Filename':encodeURIComponent(f.name),
+      'X-Version':encodeURIComponent(document.getElementById('fwver').value.trim()),
+      'X-Notes':encodeURIComponent(document.getElementById('fwnotes').value)}}}});
+    const b=await r.json().catch(()=>null);
+    if(!r.ok) throw new Error((b&&b.error&&b.error.message)||('HTTP '+r.status));
+    toast('Versie '+b.release.version+' geüpload','ok'); setTimeout(()=>location.reload(),800);
+  }}catch(e){{ toast(e.message,'bad'); }}
+}}
+async function fwAssignMany(){{
+  const ids=[...document.querySelectorAll('.fwdev:checked')].map(x=>x.value);
+  if(!ids.length){{toast('Kies minstens één apparaat','bad');return;}}
+  await act('/admin/api/firmware/'+encodeURIComponent(document.getElementById('fwrel').value)+'/assign',
+    {{device_ids:ids}});
+  toast('Klaargezet voor '+ids.length+' apparaat/apparaten','ok'); setTimeout(()=>location.reload(),700);
+}}
+async function fwDelete(id){{ if(!confirm('Deze firmware verwijderen?'))return;
+  await act('/admin/api/firmware/'+encodeURIComponent(id),{{}},'DELETE'); location.reload(); }}
+</script>"""
+    return layout("Firmware", body, "firmware", who)
