@@ -212,7 +212,8 @@ def enrolment_block(device: dict[str, Any]) -> dict[str, Any]:
     never has to keep it; an expired code is replaced here, lazily.
     """
     if not is_pending(device):
-        return {"state": ACTIVE, "linked": bool(device.get("user_id"))}
+        return {"state": ACTIVE, "linked": bool(device.get("user_id")),
+                "owner": owner_block(device)}
     code = ""
     try:
         code = secretbox.open_(device.get("pairing_code"))
@@ -228,6 +229,30 @@ def enrolment_block(device: dict[str, Any]) -> dict[str, Any]:
         device["pairing_expires_at"] = new_expiry
     return {"state": PENDING, "pairing_code": code,
             "pairing_expires_at": device.get("pairing_expires_at")}
+
+
+def owner_block(device: dict[str, Any]) -> dict[str, Any] | None:
+    """Who this recorder belongs to, for its own screen.
+
+    The user id here *is* the OurMind account (users are keyed by their
+    OurMind e-mail), so the address is the OurMind login the recordings go to.
+    `ourmind` says whether that user is signed in to OurMind right now, i.e.
+    whether a recording could actually be delivered there.
+    """
+    user_id = device.get("user_id")
+    if not user_id:
+        return None
+    user = users.get(user_id)
+    if user is None:
+        return None
+    try:
+        status = users.token_status(user_id)
+        connected = bool(status.get("present")) and (
+            not status.get("expired") or bool(status.get("refreshable")))
+    except (ValueError, TypeError):
+        connected = False
+    return {"email": user["email"], "name": user.get("display_name") or "",
+            "ourmind": connected}
 
 
 def pending_devices() -> list[dict[str, Any]]:

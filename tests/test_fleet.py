@@ -481,3 +481,16 @@ def test_a_factory_reset_recorder_enrols_again_with_its_old_token(server, linked
     assert _link(server, body["enrolment"]["pairing_code"]).status_code == 200
     assert users.owner_of_device(BRIAN)["user_id"] == linked["user"]["user_id"]
     assert _config(server, BRIAN, body["token"])["upload_enabled"] is True
+
+
+def test_the_recorder_learns_whose_ourmind_account_it_serves(server, linked):
+    cfg = _config(server, BRIAN, linked["token"])
+    owner = cfg["enrolment"]["owner"]
+    assert owner["email"] == "dokter@praktijk.nl"
+    assert owner["ourmind"] is False            # not signed in to OurMind yet
+    from app import users
+    users.store_token(linked["user"]["user_id"], "access", "refresh", None)
+    assert _config(server, BRIAN, linked["token"])["enrolment"]["owner"]["ourmind"] is True
+    users.bind_device(BRIAN, None)
+    cfg = _config(server, BRIAN, linked["token"])
+    assert cfg["enrolment"]["owner"] is None and cfg["enrolment"]["linked"] is False

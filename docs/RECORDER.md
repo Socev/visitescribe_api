@@ -234,7 +234,10 @@ recorder authenticates normally but every upload is refused with
 `403 DEVICE_PENDING`. Show the pairing code on the screen; an admin types it
 in under **Devices → Nieuwe recorders** and picks the user. `GET /v1/device/config`
 returns the code again on every read (renewed when it expires), and returns
-`"enrolment": {"state": "active", "linked": true}` once linked.
+`"enrolment": {"state": "active", "linked": true, "owner": {"email": "…",
+"name": "…", "ourmind": true}}` once linked. `owner.email` is the user's
+OurMind login (the account recordings go to); `ourmind` says whether that user
+is currently signed in to OurMind. `owner` is `null` for a device bound to nobody.
 
 | Situation | Result |
 |---|---|
