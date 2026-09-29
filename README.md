@@ -283,6 +283,11 @@ derived from `mode` rather than trusted to whoever picks the route:
 | `multi_patient` | `mistral`, `ourmind` |
 | `meeting` | `mistral` |
 
+On top of that, **users get OurMind only** (since 1.11.0). Other transcribers
+are switched on per user by an admin (Gebruikers → "Andere transcribers dan
+OurMind"). Switching it off moves that user's standing rules back to OurMind.
+The admin can still send a single recording to any allowed provider by hand.
+
 The check runs when the job is queued **and again in the worker**, immediately
 before any audio leaves the machine. A route that was retired — `plaud`,
 `local` — answers with the reason it was retired rather than "unknown".
@@ -370,6 +375,8 @@ when the recorder returns running the new version. Details and the wire format:
 | `VS_MAX_FIRMWARE_BYTES` | `6291456` | largest accepted image (one OTA slot is 6.25 MiB) |
 | `VS_DEVICE_LOG_DAYS` | `30` | how long recorder log lines are kept |
 | `VS_DEVICE_LOG_MAX_LINES` | `200000` | log lines kept per device |
+| `VS_AUTO_PURGE_AUDIO` | `true` | remove audio automatically once processed |
+| `VS_DIAGNOSTIC_AUDIO_DAYS` | `30` | how long diagnostic-mode audio is kept |
 
 ---
 
@@ -422,6 +429,20 @@ concerns with separate lifetimes. Purge is available per session with scope
 `source_audio`, `working_audio` or `all`; `all` moves the session to `PURGED` and
 drops the wrapped key so the audio is unrecoverable. **The audit record that a
 purge happened is always retained.**
+
+**Audio is removed automatically once processed** (since 1.11.0,
+`app/retention.py`). When every job of a recording is done and it has a
+report, its encrypted chunks, working copies, cached key and key wrap are
+deleted (purge scope `audio`, actor `auto`). Session, transcript, report,
+costs and audit stay. The session keeps `ingest_confirmed`, so a recorder that
+asks again is told "done" and never re-uploads. Failed or unprocessed
+recordings keep their audio.
+
+*Diagnostische modus* (per device, admin device page): every recording made
+while it is on is marked `keep_audio` and keeps its audio, for at most
+`VS_DIAGNOSTIC_AUDIO_DAYS` days. Turning it off does not touch recordings
+already kept. Recordings from before the upgrade are not removed
+automatically; the Sessions page offers a one-click cleanup for them.
 
 ---
 

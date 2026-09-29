@@ -275,21 +275,26 @@ async def create_session(request: Request) -> Response:
         body["created"] = False
         idempotency.record(idem_key, ident.device_id, "sessions.create", request_hash,
                            200, body)
-        crypto.cache_session_key(manifest.session_id, session_key,
-                                 settings.session_key_cache_seconds)
+        if not existing["audio_purged_at"]:
+            crypto.cache_session_key(manifest.session_id, session_key,
+                                     settings.session_key_cache_seconds)
         return JSONResponse(status_code=200, content=body)
 
     ts = now_iso()
     manifest_json = json.dumps(payload, sort_keys=True, separators=(",", ":"),
                                ensure_ascii=False)
+    # Diagnostic mode is decided per recording, at the moment it arrives.
+    diag = db.query_one("SELECT diagnostic_mode FROM devices WHERE device_id = ?",
+                        (ident.device_id,))
+    keep_audio = 1 if diag is not None and diag["diagnostic_mode"] else 0
     with db.tx() as conn:
         conn.execute(
             "INSERT INTO sessions(session_id, device_id, schema_version, mode, "
             "client_status, started_at, completed_at, audio_json, encryption_json, "
             "wrap_algorithm, wrap_ciphertext_b64, wrap_key_id, manifest_json, "
             "manifest_fingerprint, expected_chunks, state, ingest_confirmed, "
-            "processing_json, created_at, updated_at) "
-            "VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            "processing_json, created_at, updated_at, keep_audio) "
+            "VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
             (
                 manifest.session_id, ident.device_id, manifest.schema_version,
                 manifest.mode, manifest.status, manifest.started_at,
@@ -304,6 +309,7 @@ async def create_session(request: Request) -> Response:
                 wrap.algorithm, wrap.ciphertext_b64, key_id, manifest_json,
                 request_hash, len(chunk_specs), "RECEIVING", 0,
                 json.dumps(manifest.processing or {}, default=str), ts, ts,
+                keep_audio,
             ),
         )
         for spec in chunk_specs:
@@ -328,6 +334,7 @@ async def create_session(request: Request) -> Response:
                 "expected_chunks": len(chunk_specs),
                 "wrap_key_id": key_id,
                 "started_at": manifest.started_at,
+                "keep_audio": bool(keep_audio),
             },
             conn=conn,
         )

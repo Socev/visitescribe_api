@@ -79,6 +79,42 @@ def check(mode: str, route: str) -> None:
         )
 
 
+# The transcriber every user gets. Others (Mistral) are switched on per user
+# by an admin (users.allow_other_providers); until then a user sees and can
+# choose only this one. The admin can still route a single recording anywhere
+# the policy above allows.
+DEFAULT_PROVIDER = "ourmind"
+
+
+def user_may_use_others(user: dict | None) -> bool:
+    if not user:
+        return False
+    try:
+        return bool(user["allow_other_providers"])
+    except (KeyError, IndexError):
+        return False
+
+
+def allowed_for_user(mode: str, user: dict | None) -> frozenset[str]:
+    """What `user` may pick for a recording of `mode`."""
+    allowed = allowed_for(mode)
+    if user_may_use_others(user):
+        return allowed
+    return allowed & {DEFAULT_PROVIDER}
+
+
+def check_user(mode: str, route: str, user: dict | None) -> None:
+    """check(), plus the per-user switch for transcribers other than OurMind."""
+    check(mode, route)
+    if route not in allowed_for_user(mode, user):
+        raise ApiError(
+            "ROUTE_NOT_ALLOWED",
+            f"{route!r} staat niet aan voor deze gebruiker; alleen "
+            f"{DEFAULT_PROVIDER!r} is toegestaan.",
+            status_code=403,
+        )
+
+
 def describe() -> list[dict]:
     """What the settings pages show. Derived, never a second copy of the rule."""
     from . import users

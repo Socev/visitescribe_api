@@ -5,6 +5,7 @@ has no route to it at all, rather than relying on path matching.
 """
 from __future__ import annotations
 
+import asyncio
 import io
 import json
 import zipfile
@@ -18,8 +19,9 @@ from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse, Stre
 
 from urllib.parse import unquote
 
-from . import (__version__, adminauth, audio, audit, crypto, db, devicelogs, fleet, flacinfo,
-               pricing, processing, routing, sessions, storage, users)
+from . import (__version__, adminauth, audio, audit, crypto, db, devicelogs, fleet,
+               flacinfo, pricing, processing, retention, routing, sessions, storage,
+               users)
 from .providers import credentials as provider_credentials
 from .providers import get as get_provider
 from .admin_html import (
@@ -178,6 +180,20 @@ def create_admin_app() -> FastAPI:
                             actor=who)
         return JSONResponse({"user": user}, status_code=201)
 
+    @app.post("/admin/api/users/{user_id}/providers", include_in_schema=False)
+    async def set_user_providers(user_id: str, request: Request):  # noqa: ANN202
+        who = guard(request)
+        body = await _body(request)
+        moved = users.set_allow_other_providers(
+            user_id, bool(body.get("allow_other_providers")), actor=who)
+        return JSONResponse({"ok": True, "rules_moved": moved})
+
+    @app.post("/admin/api/retention/backlog", include_in_schema=False)
+    async def purge_audio_backlog(request: Request):  # noqa: ANN202
+        """Remove the audio of recordings processed before 1.11.0."""
+        who = guard(request)
+        return JSONResponse(await asyncio.to_thread(retention.purge_processed_backlog, who))
+
     @app.post("/admin/api/users/{user_id}/enabled", include_in_schema=False)
     async def set_user_enabled(user_id: str, request: Request):  # noqa: ANN202
         who = guard(request)
@@ -293,7 +309,7 @@ def create_admin_app() -> FastAPI:
         result = processing.enqueue(
             session_id, route, actor=who, force=bool(body.get("force")),
             template_id=str(body.get("template_id") or ""),
-            template_type=str(body.get("template_type") or ""))
+            template_type=str(body.get("template_type") or ""), by_admin=True)
         return JSONResponse(result)
 
     @app.get("/admin/api/sessions/{session_id}/stand", include_in_schema=False)
@@ -433,6 +449,8 @@ def create_admin_app() -> FastAPI:
             (session_id, sequence)))
         if row is None:
             raise ApiError("UNKNOWN_SESSION", "Unknown chunk")
+        if (sessions.get(session_id) or {}).get("audio_purged_at"):
+            raise ApiError("AUDIO_PURGED", "De audio van deze opname is verwijderd")
         data = storage.read_blob(row["blob_path"])
         if form == "encrypted":
             audit.log("export", "chunk_downloaded", "success", session_id=session_id,
@@ -530,6 +548,13 @@ def create_admin_app() -> FastAPI:
                 updates.append(f"{field} = ?")
                 params.append(1 if body[field] else 0)
                 changed[field] = bool(body[field])
+        if "diagnostic_mode" in body:
+            on = bool(body["diagnostic_mode"])
+            updates.append("diagnostic_mode = ?")
+            params.append(1 if on else 0)
+            updates.append("diagnostic_since = ?")
+            params.append(now_iso() if on else None)
+            changed["diagnostic_mode"] = on
         if "cert_fingerprint" in body:
             fp = str(body["cert_fingerprint"] or "").strip().lower().replace(":", "")
             if fp and (len(fp) != 64 or any(c not in "0123456789abcdef" for c in fp)):
@@ -871,6 +896,7 @@ def _sessions_data(state: str = "", device: str = "", q: str = "",
         "page": page, "per_page": per,
         "filters": {"state": state, "device": device, "q": q},
         "states": list(ALL_STATES),
+        "audio_backlog": len(retention.backlog()),
         "devices": [r["device_id"] for r in db.query(
             "SELECT DISTINCT device_id FROM sessions ORDER BY device_id")],
     }
@@ -923,6 +949,7 @@ def _session_detail(session_id: str) -> dict[str, Any] | None:
         "missing_chunks": sessions.missing_chunks(session_id),
         "unverified_chunks": sessions.unverified_chunks(session_id),
         "processing": processing_meta,
+        "audio_status": retention.audio_status(session),
         "results": processing.results_for(session_id),
         "allowed_routes": sorted(routing.allowed_for(session["mode"])),
         **_owner_templates(session_id, session["mode"]),
@@ -1030,6 +1057,11 @@ def _device_detail(device_id: str) -> dict[str, Any] | None:
         "wifi": fleet.wifi_view(dict(row)),
         "update": fleet.update_of(device_id),
         "logs": devicelogs.status(dict(row)),
+        "kept_audio": int((db.query_one(
+            "SELECT COUNT(*) AS n FROM sessions WHERE device_id = ? AND keep_audio = 1 "
+            "AND audio_purged_at IS NULL AND state != 'PURGED'", (device_id,))
+            or {"n": 0})["n"]),
+        "diagnostic_days": settings.diagnostic_audio_days,
         "releases": [{"release_id": r["release_id"], "version": r["version"],
                       "created_at": r["created_at"]} for r in fleet.releases()],
     }
@@ -1039,6 +1071,8 @@ def _decrypt_chunk(session_id: str, row: dict[str, Any]) -> bytes:
     session = sessions.get(session_id)
     if session is None:
         raise ApiError("UNKNOWN_SESSION", "Unknown session")
+    if session.get("audio_purged_at"):
+        raise ApiError("AUDIO_PURGED", "De audio van deze opname is verwijderd")
     wrapped = session.get("wrap_ciphertext_b64")
     if not wrapped:
         raise ApiError("INVALID_KEY_WRAP", "Session has no server key wrap")
@@ -1119,8 +1153,9 @@ def _session_zip(session_id: str) -> io.BytesIO:
                                               indent=2, default=str))
         zf.writestr("audit.json", json.dumps(audit.recent(limit=5000, session_id=session_id),
                                              indent=2, default=str))
-        for row in db.query("SELECT * FROM chunks WHERE session_id = ? ORDER BY sequence",
-                            (session_id,)):
+        rows = [] if session.get("audio_purged_at") else db.query(
+            "SELECT * FROM chunks WHERE session_id = ? ORDER BY sequence", (session_id,))
+        for row in rows:
             zf.writestr(f"audio/chunk-{int(row['sequence']):06d}.flac.enc",
                         storage.read_blob(row["blob_path"]))
     return buf

@@ -457,6 +457,7 @@ def get_conn() -> sqlite3.Connection:
                 conn.executescript(SCHEMA)
                 _add_missing_columns(conn)
                 _seed_recording_types(conn)
+                _restrict_routes(conn)
                 _initialised = True
     return conn
 
@@ -479,7 +480,44 @@ ADDED_COLUMNS: tuple[tuple[str, str, str], ...] = (
     ("devices", "log_request_id", "INTEGER NOT NULL DEFAULT 0"),
     ("devices", "log_request_done", "INTEGER NOT NULL DEFAULT 0"),
     ("devices", "log_request_at", "TEXT"),
+    # Diagnostische modus: recordings made while this is on keep their audio
+    # (for at most VS_DIAGNOSTIC_AUDIO_DAYS). Off = audio goes once processed.
+    ("devices", "diagnostic_mode", "INTEGER NOT NULL DEFAULT 0"),
+    ("devices", "diagnostic_since", "TEXT"),
+    # Snapshot of diagnostic_mode when the session was created, so flipping
+    # the switch later never changes what happens to an existing recording.
+    ("sessions", "keep_audio", "INTEGER NOT NULL DEFAULT 0"),
+    # Set when the audio (ciphertext, working copies, key wrap) was removed
+    # after processing. The session, transcript and report stay.
+    ("sessions", "audio_purged_at", "TEXT"),
+    # Other transcribers than OurMind are off for users unless an admin
+    # ticks this per user.
+    ("users", "allow_other_providers", "INTEGER NOT NULL DEFAULT 0"),
 )
+
+
+def _restrict_routes(conn: sqlite3.Connection) -> None:
+    """Standing rules may only name OurMind unless the user may use others.
+
+    Rules saved before 1.11.0 could point at Mistral. Rather than let them
+    fail at the worker every time, they are moved to OurMind (auto stays as
+    it was). Runs at every start, so it is also a backstop if the admin
+    switch and a rule ever disagree.
+    """
+    from .util import now_iso
+
+    cur = conn.execute(
+        "UPDATE routing_rules SET route = 'ourmind', updated_at = ? "
+        "WHERE route NOT IN ('', 'ourmind') AND user_id IN "
+        "(SELECT user_id FROM users WHERE allow_other_providers = 0)",
+        (now_iso(),))
+    if cur.rowcount:
+        conn.execute(
+            "INSERT INTO audit(ts, category, action, outcome, identity, detail_json) "
+            "VALUES(?,?,?,?,?,?)",
+            (now_iso(), "routing", "rules_moved_to_ourmind", "success", "system",
+             '{"rules": %d}' % cur.rowcount))
+    conn.commit()
 
 
 def _add_missing_columns(conn: sqlite3.Connection) -> None:

@@ -39,7 +39,7 @@ BACKOFF_SECONDS = (30, 120, 600, 1800)
 
 def enqueue(session_id: str, route: str, *, actor: str = "admin",
             force: bool = False, template_id: str = "",
-            template_type: str = "") -> dict[str, Any]:
+            template_type: str = "", by_admin: bool = False) -> dict[str, Any]:
     """Queue a confirmed session for processing on `route`.
 
     `template_id` overrides the user's standing rule for this one run, which
@@ -52,6 +52,11 @@ def enqueue(session_id: str, route: str, *, actor: str = "admin",
         raise ApiError("UNKNOWN_SESSION", "Unknown session")
     if session["state"] == "PURGED":
         raise ApiError("SESSION_PURGED", "Deze sessie is gewist")
+    if session.get("audio_purged_at"):
+        raise ApiError(
+            "AUDIO_PURGED",
+            "De audio van deze opname is na verwerking verwijderd; opnieuw "
+            "verwerken kan niet meer. Transcript en verslag staan er nog.")
     if not session["ingest_confirmed"] and not force:
         raise ApiError(
             "INVALID_REQUEST",
@@ -68,6 +73,11 @@ def enqueue(session_id: str, route: str, *, actor: str = "admin",
     # credential here than the worker uses would accept jobs that can only
     # fail later, on someone else's behalf.
     owner = users.owner_of_session(session_id)
+    # Transcribers other than OurMind are per-user opt-in. The admin can still
+    # send a single recording elsewhere by hand; the user and the automatic
+    # rule cannot.
+    if owner is not None and not by_admin:
+        routing.check_user(session["mode"], route, owner)
     token = None
     if owner is not None and route == "ourmind":
         token = users.access_token(owner["user_id"])
@@ -86,9 +96,17 @@ def enqueue(session_id: str, route: str, *, actor: str = "admin",
     ts = now_iso()
     created = 0
     with db.tx() as conn:
+        # Re-checked under the write lock: the retention purge claims a session
+        # under the same lock, so the two can never both win.
+        gone = conn.execute("SELECT audio_purged_at FROM sessions WHERE session_id = ?",
+                            (session_id,)).fetchone()
+        if gone is not None and gone["audio_purged_at"]:
+            raise ApiError("AUDIO_PURGED",
+                           "De audio van deze opname is net na verwerking verwijderd.")
         conn.execute(
             "UPDATE sessions SET processing_json = ?, updated_at = ? WHERE session_id = ?",
             (json.dumps({"route": route, "queued_at": ts, "actor": actor,
+                         "by_admin": bool(by_admin),
                          "template_id": template_id,
                          "template_type": template_type or "template"}),
              ts, session_id),
@@ -412,6 +430,21 @@ def run_job(job: dict[str, Any]) -> None:
     # report. Without an owner we fall back to the pod-wide credential, which
     # is what a single-user installation has.
     owner = users.owner_of_session(job["session_id"])
+    if session.get("audio_purged_at") and job["stage"] == "transcribe":
+        raise ApiError("AUDIO_PURGED", "De audio van deze opname is al verwijderd")
+    try:
+        queued_by = json.loads(session["processing_json"] or "{}")
+    except (TypeError, ValueError):
+        queued_by = {}
+    # Queued before 1.11.0 there is no flag: then anyone but the automatic
+    # rule and the owner themself was an admin.
+    by_admin = queued_by.get("by_admin")
+    if by_admin is None:
+        by_admin = queued_by.get("actor") not in ("auto", (owner or {}).get("email"))
+    if owner is not None and not by_admin:
+        # Re-checked here too: the switch may have been turned off between
+        # queueing and now, and this is the last point before audio leaves.
+        routing.check_user(session["mode"], job["route"], owner)
     token = None
     if owner is not None and job["route"] == "ourmind":
         # Deliberately not caught: if the user's session has lapsed the job
@@ -606,6 +639,11 @@ def run_job(job: dict[str, Any]) -> None:
     if not _outstanding(job["session_id"]):
         sessions.set_state(job["session_id"], "REVIEW_REQUIRED", ingest_confirmed=True,
                            actor="worker")
+        # Every part has a report: the audio has done its job. Kept only for
+        # a recorder in diagnostic mode, or when something failed.
+        from . import retention
+
+        retention.after_processing(job["session_id"])
 
 
 def _outstanding(session_id: str) -> int:

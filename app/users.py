@@ -81,6 +81,34 @@ def set_disabled(user_id: str, disabled: bool, *, actor: str = "admin") -> None:
               identity=actor, detail={"user_id": user_id})
 
 
+def set_allow_other_providers(user_id: str, allow: bool, *,
+                              actor: str = "admin") -> int:
+    """Switch transcribers other than OurMind on or off for one user.
+
+    Switching off also moves the user's standing rules back to OurMind, so an
+    automatic route cannot keep sending audio where it no longer may go.
+    Returns the number of rules moved.
+    """
+    if get(user_id) is None:
+        from .errors import ApiError
+
+        raise ApiError("INVALID_REQUEST", "Unknown user")
+    db.execute("UPDATE users SET allow_other_providers = ?, updated_at = ? "
+               "WHERE user_id = ?", (1 if allow else 0, now_iso(), user_id))
+    moved = 0
+    if not allow:
+        moved = db.execute(
+            "UPDATE routing_rules SET route = 'ourmind', updated_at = ? "
+            "WHERE user_id = ? AND route NOT IN ('', 'ourmind')",
+            (now_iso(), user_id)).rowcount or 0
+    from . import audit
+
+    audit.log("users", "other_providers_" + ("allowed" if allow else "blocked"),
+              "success", identity=actor,
+              detail={"user_id": user_id, "rules_moved": moved})
+    return moved
+
+
 def touch(user_id: str) -> None:
     db.execute("UPDATE users SET last_seen_at = ? WHERE user_id = ?",
                (now_iso(), user_id))
@@ -297,7 +325,7 @@ def set_rule(user_id: str, mode: str, *, route: str = "", template_id: str = "",
     from . import routing
 
     if route:
-        routing.check(mode, route)
+        routing.check_user(mode, route, get(user_id))
     db.execute(
         "INSERT INTO routing_rules(user_id, mode, route, template_id, template_type, "
         "template_title, auto, updated_at) VALUES(?,?,?,?,?,?,?,?) "

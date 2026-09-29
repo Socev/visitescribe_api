@@ -14,10 +14,11 @@ import asyncio
 import logging
 import signal
 import sys
+import time
 
 import uvicorn
 
-from . import processing
+from . import processing, retention
 from .admin_app import create_admin_app
 from .api_app import create_app
 from .user_app import create_user_app
@@ -113,8 +114,15 @@ async def _worker_loop() -> None:
     except Exception:  # noqa: BLE001
         log.exception("could not requeue orphaned jobs")
 
+    try:
+        # Pins the moment automatic audio removal started on this install.
+        retention.since()
+    except Exception:  # noqa: BLE001
+        log.exception("could not read audio retention start")
+
     idle = settings.processing_poll_seconds
     since_sweep = 0.0
+    last_retention = time.monotonic() - 3000     # first sweep ~10 min after start
     while True:
         try:
             # Bounded on purpose. A job that never returns used to take the
@@ -145,6 +153,17 @@ async def _worker_loop() -> None:
                 await asyncio.to_thread(processing.reclaim_stale)
             except Exception:  # noqa: BLE001
                 log.exception("stale job sweep failed")
+            # Audio retention backstop: expired diagnostic audio, and any
+            # removal the worker missed (a crash between report and purge).
+            now_mono = time.monotonic()
+            if now_mono - last_retention >= 3600:
+                last_retention = now_mono
+                try:
+                    done = await asyncio.to_thread(retention.sweep)
+                    if any(done.values()):
+                        log.info("audio retention sweep: %s", done)
+                except Exception:  # noqa: BLE001
+                    log.exception("audio retention sweep failed")
         await asyncio.sleep(0 if did_work else idle)
 
 

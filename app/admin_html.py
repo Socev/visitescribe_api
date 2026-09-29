@@ -352,10 +352,23 @@ def render_sessions(d: dict[str, Any], who: str) -> str:
 <div class="narrow"><button class="primary">Filter</button></div>
 <div class="narrow"><a class="btn" href="/admin/sessions">Reset</a></div>
 </form></div>
+{_backlog_panel(d)}
 <div class="panel">{_sessions_table(d['sessions'])}
 <div class="pager">{prev}<span class="muted">Page {d['page']} of {pages}</span>{nxt}</div>
 </div>"""
     return layout("Sessions", body, "sessions", who)
+
+
+def _backlog_panel(d: dict[str, Any]) -> str:
+    n = d.get("audio_backlog") or 0
+    if not n:
+        return ""
+    return f"""<div class="panel"><h3 style="margin-top:0">Oude audio opruimen</h3>
+<p class="muted" style="margin-top:0">{n} opname(s) van vóór de automatische verwijdering
+zijn volledig verwerkt maar hebben hun audio nog. Nieuwe opnames verliezen hun audio
+vanzelf na verwerking; deze oude laat de server aan jou.</p>
+<button class="danger" onclick="if(confirm('Audio van {n} verwerkte opname(s) definitief verwijderen? Transcript en verslag blijven.'))act('/admin/api/retention/backlog',{{}}).then(r=>{{toast(r.sessions+' opname(s) opgeschoond','ok');setTimeout(()=>location.reload(),700)}})">
+Audio van {n} verwerkte opname(s) verwijderen</button></div>"""
 
 
 def _qs(filters: dict[str, Any], page: int) -> str:
@@ -386,6 +399,16 @@ def render_session_detail(d: dict[str, Any], who: str) -> str:
             '<div class="banner warn">The recorder reported this session as '
             "<strong>interrupted</strong>. The ingest can still be complete and valid, but "
             "up to the last chunk interval of audio may never have been captured.</div>")
+    au = d.get("audio_status") or {}
+    if au.get("state") == "removed":
+        banners.append(
+            f'<div class="banner">Audio verwijderd op {_e(_t(au.get("at")) or au.get("at"))}'
+            " na verwerking. Transcript, verslag en audit blijven bewaard; downloaden "
+            "en opnieuw verwerken kan niet meer.</div>")
+    elif au.get("state") == "kept":
+        banners.append(
+            f'<div class="banner warn">{_e(au.get("label"))}. Deze opname is gemaakt in '
+            "diagnostische modus.</div>")
     if raw.get("purged_at"):
         banners.append(
             f'<div class="banner bad">Purged at {_e(raw["purged_at"])}. Audit records are '
@@ -574,7 +597,7 @@ def render_devices(d: dict[str, Any], who: str) -> str:
 <td class="right">{x['sessions_confirmed']}</td>
 <td class="muted nowrap">{_e(_t(x['last_seen_at']) or '—')}</td>
 <td class="muted">{_e(x['last_auth_method'] or '—')}</td>
-<td>{_e(x.get('software_version') or '—')} {update_chip(x.get('update_state'), x.get('update_version'))}</td></tr>"""
+<td>{_e(x.get('software_version') or '—')} {update_chip(x.get('update_state'), x.get('update_version'))}{' <span class="chip bad">diagnose</span>' if x.get('diagnostic_mode') else ''}</td></tr>"""
         for x in d["devices"]
     ) or '<tr><td colspan="8" class="muted">No devices yet.</td></tr>'
 
@@ -687,6 +710,7 @@ certificate (DER). Once pinned, every request from this device must present it.<
  value="{_e(x['cert_fingerprint'] or '')}" placeholder="64 hex characters"></div>
 <div class="narrow"><button onclick="pin()">Save fingerprint</button></div>
 <div class="narrow"><button onclick="unpin()">Remove pin</button></div></div></div>
+{_diagnostic_panel(d)}
 {_enrolment_panel(d)}
 {_wifi_panel(d)}
 {_device_firmware_panel(d)}
@@ -1188,6 +1212,11 @@ def render_users(d: dict[str, Any], who: str) -> str:
     {'<span class="chip bad">uitgeschakeld</span>' if u['disabled'] else ''}</div>
 </div>
 <div style="flex:1;min-width:220px"><h3>Recorders</h3>{devices}</div>
+<div><label style="display:flex;gap:6px;align-items:center;white-space:nowrap">
+<input type="checkbox" style="width:auto" {'checked' if u.get('allow_other_providers') else ''}
+ onchange="act('/admin/api/users/{_e(u['user_id'])}/providers',
+  {{allow_other_providers:this.checked}}).then(()=>location.reload())">
+Andere transcribers dan OurMind</label></div>
 <div><button onclick="act('/admin/api/users/{_e(u['user_id'])}/enabled',
   {{enabled:{'false' if not u['disabled'] else 'true'}}}).then(()=>location.reload())"
   >{'Inschakelen' if u['disabled'] else 'Uitschakelen'}</button></div>
@@ -1480,6 +1509,25 @@ async function fwDelete(id){{ if(!confirm('Deze firmware verwijderen?'))return;
   await act('/admin/api/firmware/'+encodeURIComponent(id),{{}},'DELETE'); location.reload(); }}
 </script>"""
     return layout("Firmware", body, "firmware", who)
+
+
+def _diagnostic_panel(d: dict[str, Any]) -> str:
+    """Diagnostische modus: keep the audio of new recordings from this device."""
+    x = d["device"]
+    on = bool(x.get("diagnostic_mode"))
+    days = d.get("diagnostic_days", 30)
+    kept = d.get("kept_audio", 0)
+    state = (f'<span class="chip bad">aan sinds {_e(_t(x.get("diagnostic_since")) or "?")}</span>'
+             if on else '<span class="chip ok">uit</span>')
+    return f"""<div class="panel"><h3 style="margin-top:0">Diagnostische modus {state}</h3>
+<p class="muted" style="margin-top:0">Uit (standaard): de audio van een opname wordt
+verwijderd zodra hij volledig verwerkt is; transcript en verslag blijven staan. Aan:
+elke opname die deze recorder vanaf nu maakt houdt zijn audio, maximaal {_e(days)} dagen.
+Uitzetten verandert niets aan opnames die al bewaard worden. De recorder zelf wist
+zijn kopie altijd na een geslaagde synchronisatie.</p>
+<p class="muted">Opnames met bewaarde audio van deze recorder: <b>{_e(kept)}</b></p>
+<button class="{'primary' if not on else ''}" onclick="if(confirm('{'Diagnostische modus uitzetten?' if on else 'Diagnostische modus aanzetten? Audio van nieuwe opnames blijft dan tot ' + str(days) + ' dagen bewaard.'}'))upd({{diagnostic_mode:{'false' if on else 'true'}}})">
+{'Uitzetten' if on else 'Aanzetten'}</button></div>"""
 
 
 def _device_logs_panel(d: dict[str, Any]) -> str:

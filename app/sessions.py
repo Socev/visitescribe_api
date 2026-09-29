@@ -321,7 +321,10 @@ def evaluate(session_id: str, *, conn=None) -> dict[str, Any]:
     session = get(session_id)
     if session is None:
         return {}
-    if session["state"] == "PURGED":
+    if session["state"] == "PURGED" or session.get("audio_purged_at"):
+        # Audio removed after processing: the chunk records stay but the key
+        # wrap is gone on purpose. Nothing to re-evaluate, and the recorder
+        # must go on seeing "confirmed" so it never uploads it again.
         return status_payload(session_id)
 
     expected = manifest_sequences(session_id)

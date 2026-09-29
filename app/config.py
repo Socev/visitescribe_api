@@ -132,6 +132,14 @@ class Settings:
     device_log_max_upload: int = field(
         default_factory=lambda: _i("VS_DEVICE_LOG_MAX_UPLOAD", 256 * 1024))
 
+    # --- audio retention (app/retention.py) ---------------------------------
+    # Audio of a recording made in diagnostic mode is kept at most this long.
+    diagnostic_audio_days: int = field(
+        default_factory=lambda: _i("VS_DIAGNOSTIC_AUDIO_DAYS", 30))
+    # Off = never remove audio automatically (the old behaviour).
+    auto_purge_audio: bool = field(
+        default_factory=lambda: _b("VS_AUTO_PURGE_AUDIO", True))
+
     public_base_url: str = field(default_factory=lambda: _s("VS_PUBLIC_BASE_URL", ""))
     log_level: str = field(default_factory=lambda: _s("VS_LOG_LEVEL", "info"))
 

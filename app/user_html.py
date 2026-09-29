@@ -332,7 +332,11 @@ Er is nog niets verwerkt voor deze opname.</div></div>"""
     routes = d.get("allowed_routes") or []
     options = "".join(f'<option value="{_e(r)}">{_e(r)}</option>' for r in routes)
     action = ""
-    if routes and not d.get("busy"):
+    if rec.get("audio_purged_at"):
+        action = """<div class="panel"><p class="sub" style="margin:0">De audio van deze
+opname is na verwerking verwijderd. Het transcript en het verslag blijven hier staan;
+opnieuw verwerken kan niet meer.</p></div>"""
+    elif routes and not d.get("busy"):
         action = f"""<div class="panel"><h2>Verwerken</h2>
 <p class="sub">Toegestaan voor {_e(kind)}: <b>{_e(', '.join(routes))}</b>.</p>
 <form method="post" action="/opname/{_e(rec['session_id'])}/verwerken"

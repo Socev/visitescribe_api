@@ -69,6 +69,8 @@ def _session_key(session: dict) -> bytes:
 
 def _decoded_chunks(session: dict) -> Iterator[bytes]:
     """Plaintext FLAC for each chunk, in sequence order."""
+    if session.get("audio_purged_at"):
+        raise ApiError("AUDIO_PURGED", "De audio van deze opname is na verwerking verwijderd")
     key = _session_key(session)
     rows = db.query(
         "SELECT sequence, nonce_b64, aad, blob_path FROM chunks "

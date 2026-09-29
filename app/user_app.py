@@ -173,7 +173,7 @@ def create_user_app() -> FastAPI:
             "recording": rec,
             "results": merged,
             "types": users.recording_types(),
-            "allowed_routes": sorted(routing.allowed_for(rec["mode"])),
+            "allowed_routes": sorted(routing.allowed_for_user(rec["mode"], user)),
             "busy": busy,
         }, _who(user)))
 
@@ -206,7 +206,8 @@ def create_user_app() -> FastAPI:
 
         types = []
         for kind in users.recording_types():
-            types.append({**kind, "allowed": sorted(routing.allowed_for(kind["mode"]))})
+            types.append({**kind, "allowed": sorted(
+                routing.allowed_for_user(kind["mode"], user))})
 
         return HTMLResponse(render_settings({
             "types": types,
@@ -230,7 +231,7 @@ def create_user_app() -> FastAPI:
             raw = str(form.get(f"template__{mode}") or "").strip()
             template_id, _, template_type = raw.partition(":")
             auto = bool(form.get(f"auto__{mode}"))
-            if route and route not in routing.allowed_for(mode):
+            if route and route not in routing.allowed_for_user(mode, user):
                 # Ignore rather than fail the whole form: the picker is built
                 # from the policy, so this only happens if the policy moved
                 # while the page was open.

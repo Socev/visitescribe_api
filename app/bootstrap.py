@@ -76,6 +76,10 @@ def initialise() -> None:
             db.set_meta("installed_at", now_iso())
             log.info("initialised new VisiteScribe store at %s", settings.data_dir)
         db.set_meta("last_start_at", now_iso())
+        # Pin when automatic audio removal started here (app/retention.py):
+        # recordings from before are left to the admin.
+        if db.get_meta("audio_retention_since") is None:
+            db.set_meta("audio_retention_since", now_iso())
     except Exception as exc:  # noqa: BLE001
         STARTUP_PROBLEMS.append(f"cannot write to the database: {exc}")
 
