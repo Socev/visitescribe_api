@@ -1032,8 +1032,13 @@ async def device_enroll(request: Request) -> Response:
     header_id = (request.headers.get("x-device-id") or "").strip()
     if header_id and header_id != req.device_id:
         raise ApiError("INVALID_DEVICE", "X-Device-ID does not match device_id")
+    # After a factory reset the recorder presents the token it held before;
+    # that is how an active device may enrol again without an admin.
+    auth = request.headers.get("authorization") or ""
+    previous = auth[7:].strip() if auth.lower().startswith("bearer ") else None
     result = fleet.enroll(req.device_id, hardware=req.hardware,
-                          software_version=req.software_version, source_ip=ip)
+                          software_version=req.software_version, source_ip=ip,
+                          previous_token=previous or None)
     return JSONResponse(status_code=201, content=result)
 
 

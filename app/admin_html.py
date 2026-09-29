@@ -1256,7 +1256,7 @@ def update_chip(state: str | None, version: str | None = None) -> str:
 
 
 def _user_options(users: list[dict[str, Any]], selected: str = "") -> str:
-    opts = ['<option value="">— nog niemand —</option>']
+    opts = ['<option value="">— huidige eigenaar houden / nog niemand —</option>']
     for u in users:
         sel = " selected" if u["user_id"] == selected else ""
         label = u.get("display_name") or u["email"]

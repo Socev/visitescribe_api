@@ -451,3 +451,33 @@ def test_the_real_release_image_is_recognised():
     info = fleet.inspect_image(path.read_bytes())
     assert info["chip"] == "esp32s3"
     assert info["version"] and info["board"] == "cores3-lite"
+
+
+def test_a_factory_reset_recorder_enrols_again_with_its_old_token(server, linked):
+    """Wiped on the device itself: it proves it is the same box with the token
+    it held, goes back to pending with a new code, and keeps its owner."""
+    from app import users
+
+    old = linked["token"]
+    wrong = server.client.post("/v1/device/enroll",
+                               json={"device_id": BRIAN, "software_version": "0.8.0"},
+                               headers={"Authorization": "Bearer not-the-token"})
+    assert wrong.status_code == 409
+
+    r = server.client.post("/v1/device/enroll",
+                           json={"device_id": BRIAN, "software_version": "0.8.0"},
+                           headers={"Authorization": f"Bearer {old}"})
+    assert r.status_code == 201, r.text
+    body = r.json()
+    assert body["enrolment"]["state"] == "pending"
+    assert users.owner_of_device(BRIAN)["user_id"] == linked["user"]["user_id"]
+    # the old token is dead, uploads wait for the admin
+    assert server.client.get("/v1/device/config",
+                             headers=_auth(BRIAN, old)).status_code == 401
+    rec = TokenRecorder(server, body["token"], device_id=BRIAN)
+    rec.add_chunk(seconds=1.0)
+    assert rec.create().json()["error"]["code"] == "DEVICE_PENDING"
+    # linking without choosing a user keeps the owner it had
+    assert _link(server, body["enrolment"]["pairing_code"]).status_code == 200
+    assert users.owner_of_device(BRIAN)["user_id"] == linked["user"]["user_id"]
+    assert _config(server, BRIAN, body["token"])["upload_enabled"] is True

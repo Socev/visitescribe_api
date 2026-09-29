@@ -96,7 +96,7 @@ def _open_window(device_id: str) -> bool:
 
 
 def enroll(device_id: str, *, hardware: Any = None, software_version: str | None = None,
-           source_ip: str = "") -> dict[str, Any]:
+           source_ip: str = "", previous_token: str | None = None) -> dict[str, Any]:
     """Register a recorder that announced itself, or re-key one allowed to.
 
     Returns the token exactly once. Three cases:
@@ -108,7 +108,11 @@ def enroll(device_id: str, *, hardware: Any = None, software_version: str | None
       reflashed); it gets a new token and a new code, nothing else changes;
     * known and active: refused, unless an admin opened an enrolment window
       for it ("opnieuw laten aanmelden"). Then it is re-keyed and keeps its
-      owner, name and history.
+      owner, name and history;
+    * known and active, and the request carries the token it held before a
+      factory reset on the recorder itself: the device proves it is the same
+      box, so it is re-keyed and goes back to *pending* with a new pairing
+      code. Its owner, name and history stay until an admin links it again.
     """
     if not settings.self_enrolment:
         audit.log("device", "self_enrol_refused", "failure", device_id=device_id,
@@ -127,6 +131,24 @@ def enroll(device_id: str, *, hardware: Any = None, software_version: str | None
         device = dict(existing)
         if not device.get("enabled") or device.get("revoked_at"):
             raise ApiError("DEVICE_DISABLED", "Device is disabled or revoked")
+        proven = bool(previous_token) and bool(device.get("token_hash")) and \
+            hmac.compare_digest(token_hash(previous_token), device["token_hash"])
+        if not is_pending(device) and not window and proven:
+            code = _new_code()
+            db.execute(
+                "UPDATE devices SET token_hash = ?, token_hint = ?, allow_header_only = 0, "
+                "enrol_state = ?, upload_enabled = 0, pairing_code = ?, "
+                "pairing_expires_at = ?, hardware_json = ?, wifi_networks_json = NULL, "
+                "software_version = COALESCE(?, software_version), updated_at = ? "
+                "WHERE device_id = ?",
+                (token_hash(token), token[:6] + "…", PENDING, secretbox.seal(code),
+                 _iso_in(settings.pairing_code_hours), _hardware(hardware), version, ts,
+                 device_id))
+            audit.log("device", "factory_reset_reenrol", "success", device_id=device_id,
+                      source_ip=source_ip, detail={"user_id": device.get("user_id")})
+            return {"device_id": device_id, "token": token,
+                    "enrolment": enrolment_block(_device(device_id)),
+                    "server_time": now_iso()}
         if not is_pending(device) and not window:
             audit.log("device", "self_enrol_refused", "failure", device_id=device_id,
                       source_ip=source_ip, detail={"reason": "already_registered"})

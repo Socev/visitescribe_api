@@ -242,6 +242,7 @@ returns the code again on every read (renewed when it expires), and returns
 | unknown ID, admin opened an enrolment window | created active, no code |
 | known, still pending | new token and new code (the recorder lost its token) |
 | known, active | `409 DEVICE_EXISTS`, unless an admin clicked *Opnieuw laten aanmelden*; then re-keyed, owner and history kept |
+| known, active, request carries its previous token as `Authorization: Bearer` | factory reset on the recorder: re-keyed, back to pending with a new code, owner and history kept until an admin links it again |
 
 Limits: `VS_ENROL_RATE_PER_MINUTE` per source address, `VS_MAX_PENDING_DEVICES`
 waiting at once, `VS_SELF_ENROLMENT=false` switches it off.
