@@ -19,9 +19,37 @@ EXTRA_CSS = """
 .hero .who{font-size:13px;color:var(--muted)}
 .list{display:flex;flex-direction:column;gap:10px}
 .list+.day{margin-top:28px}
-.row{display:flex;align-items:center;gap:14px;background:var(--panel);
+.row{display:flex;align-items:center;gap:10px;background:var(--panel);
  border:1px solid var(--line);border-radius:12px;padding:12px 14px 12px 18px;
  color:inherit;text-decoration:none}
+.row a.body{color:inherit;text-decoration:none}
+.row form{margin:0}
+.row .open{color:inherit;text-decoration:none}
+.round-label{font-weight:600}
+button.trash{background:transparent;border:1px solid transparent;border-radius:999px;
+ padding:7px 9px;line-height:0;color:var(--muted);cursor:pointer}
+button.trash.wide{display:inline-flex;align-items:center;gap:8px;line-height:1.2;
+ padding:7px 14px 7px 10px;font-size:13.5px;border-color:var(--line)}
+button.trash:hover{border-color:var(--line);color:var(--bad,#b42332)}
+.ptbar{display:flex;gap:8px;flex-wrap:wrap;margin:6px 0 14px}
+.ptbar button{border-radius:999px;padding:7px 14px;font-size:13.5px;max-width:340px;
+ overflow:hidden;text-overflow:ellipsis;white-space:nowrap;background:var(--panel);
+ border:1px solid var(--line);color:inherit;cursor:pointer}
+.ptbar button.on{background:var(--chip);border-color:var(--muted);font-weight:600}
+.ptbar button.gone{color:var(--muted);text-decoration:line-through}
+.report h2.rtitle{margin:0;font-size:20px;letter-spacing:-.01em}
+.report .rhead{display:flex;gap:10px;align-items:flex-start;justify-content:space-between}
+.report .rtools{display:flex;gap:6px;align-items:center;flex:none}
+.tabs{display:flex;gap:18px;border-bottom:1px solid var(--line);margin:12px 0 4px}
+.tabs button{background:none;border:0;border-bottom:2px solid transparent;border-radius:0;
+ padding:8px 2px;font-size:14px;color:var(--muted);cursor:pointer}
+.tabs button.on{color:inherit;border-bottom-color:currentColor;font-weight:600}
+.sec{padding:14px 0;border-top:1px solid var(--line)}
+.sec:first-child{border-top:0}
+.sec .sechead{display:flex;justify-content:space-between;align-items:center;gap:10px}
+.sec .sechead b{font-size:15px}
+.sec .sectext{white-space:pre-wrap;line-height:1.6;font-size:14.5px;margin-top:6px}
+.verify{color:var(--muted);font-style:italic;font-size:12.5px;margin:10px 0 0}
 .row:hover{border-color:var(--muted)}
 .row .body{flex:1;min-width:0}
 .row .title{font-size:15px;line-height:1.35;overflow:hidden;text-overflow:ellipsis;
@@ -89,6 +117,24 @@ function fallback(text, done){
   document.body.appendChild(ta); ta.select();
   try { document.execCommand('copy'); done(); } catch(e) { /* niets */ }
   document.body.removeChild(ta);
+}
+function showPt(id){
+  document.querySelectorAll('.report').forEach(el => el.hidden = el.id !== id);
+  document.querySelectorAll('.ptbar button').forEach(b => b.classList.toggle('on', b.dataset.pt === id));
+  if(history.replaceState) history.replaceState(null, '', '#' + id);
+}
+function showTab(report, which){
+  const r = document.getElementById(report);
+  r.querySelectorAll('.pane').forEach(p => p.hidden = p.dataset.pane !== which);
+  r.querySelectorAll('.tabs button').forEach(b => b.classList.toggle('on', b.dataset.pane === which));
+}
+function pickPt(){
+  const bar = document.querySelector('.ptbar');
+  if(!bar) return;
+  const want = location.hash.replace('#','');
+  const ids = [...bar.querySelectorAll('button')].map(b => b.dataset.pt);
+  const live = [...bar.querySelectorAll('button:not(.gone)')].map(b => b.dataset.pt);
+  showPt(ids.includes(want) ? want : (live[0] || ids[0]));
 }
 function watch(url){
   let known = null, failures = 0;
@@ -221,7 +267,9 @@ Nog geen opnames. Zodra je recorder iets instuurt verschijnt het hier.</div></di
         for label, day_rows in _by_day(rows):
             cards += (f'<h2 class="day">{_e(label)}</h2><div class="list">'
                       + "".join(_row(r, types) for r in day_rows) + "</div>")
-    return layout("Mijn opnames", f"""
+    notice = (f'<div class="panel"><p class="sub" style="margin:0">{_e(d["notice"])}</p></div>'
+              if d.get("notice") else "")
+    return layout("Mijn opnames", f"""{notice}
 <div class="hero"><div><h1>Mijn opnames</h1>
 <p class="sub">Alles wat jouw recorder heeft ingestuurd.
 <span class="live"><span class="dot"></span>ververst zichzelf</span></p></div></div>
@@ -229,36 +277,68 @@ Nog geen opnames. Zodra je recorder iets instuurt verschijnt het hier.</div></di
 <script>watch('/api/stand');</script>""", active="opnames", who=who)
 
 
+TRASH_SVG = ('<svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" '
+             'stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M3 6h18"/>'
+             '<path d="M8 6V4h8v2"/><path d="M19 6l-1 14H6L5 6"/><path d="M10 11v6M14 11v6"/></svg>')
+
+
+def _trash(action: str, question: str, label: str = "Wissen", text: bool = False) -> str:
+    """A delete button that asks first. Deleting here is final.
+
+    text=True shows the label next to the icon (the "whole round" button)."""
+    inner = TRASH_SVG + (f'<span>{_e(label)}</span>' if text else "")
+    cls = "trash wide" if text else "trash"
+    return (f'<form method="post" action="{_e(action)}" '
+            f'onsubmit="return confirm({_e(_js(question))})">'
+            f'<button class="{cls}" title="{_e(label)}" aria-label="{_e(label)}">{inner}</button>'
+            f'</form>')
+
+
+def _is_round(r: dict[str, Any]) -> bool:
+    titles = r.get("titles") or []
+    return (r.get("segment_count") or 0) > 1 or any(
+        t.get("segment_index") is not None for t in titles)
+
+
 def _row(r: dict[str, Any], types: dict[str, Any]) -> str:
     """One recording as one line, the way OurMind lists its notes.
 
-    What it was about on top (the note title, one line per patient in a
-    round), and underneath when, what kind, how long and where it went. A
-    recording with no note yet says so instead of showing an empty line.
+    A consult shows the report title. A recording with more patients is a
+    "Visiteronde": one line per patient, numbered as the recorder numbered
+    them ("Pt 1 - ..."), so the round reads as the visits it was. A
+    recording with no report yet says so instead of showing an empty line.
     """
     kind = types.get(r["mode"], {}).get("title") or r["mode"]
     titles = r.get("titles") or []
-    if titles:
-        many = len(titles) > 1
-        head = "".join(
-            f'<div class="title">'
-            + (f'<span class="seg">Patiënt {_e(t["segment_index"])}</span>'
-               if many and t.get("segment_index") is not None else "")
-            + f'{_e(t["title"])}</div>' for t in titles)
+    waiting = r["state"] in ("TRANSCRIBING", "PROCESSING") or r.get("route")
+    if _is_round(r):
+        count = max(r.get("segment_count") or 0, len(titles))
+        lines = "".join(
+            f'<div class="title"><span class="seg">Pt {_e(t["segment_index"])}</span>'
+            + (f'<i>verwijderd</i>' if t.get("deleted") else _e(t["title"]))
+            + '</div>' for t in titles if t.get("segment_index") is not None)
+        if not lines:
+            lines = (f'<div class="title none">'
+                     f'{"wordt verwerkt" if waiting else "nog niet verwerkt"}</div>')
+        head = (f'<div class="title"><span class="round-label">Visiteronde</span>'
+                f' · {count} patiënten</div>{lines}')
+        question = "Deze hele visiteronde wissen? Alle verslagen en transcripten verdwijnen definitief."
+    elif titles:
+        head = f'<div class="title">{_e(titles[0]["title"])}</div>'
+        question = "Deze opname wissen? Verslag en transcript verdwijnen definitief."
     else:
-        waiting = r["state"] in ("TRANSCRIBING", "PROCESSING") or \
-            r.get("route")
         head = (f'<div class="title none">{_e(kind)} · '
                 f'{"wordt verwerkt" if waiting else "nog niet verwerkt"}</div>')
-    patients = (f'<span>· {_e(r["segment_count"])} patiënten</span>'
-                if (r.get("segment_count") or 0) > 1 else "")
+        question = "Deze opname wissen? Hij verdwijnt definitief."
     route = f'<span class="pill">{_e(r["route"])}</span>' if r.get("route") else ""
-    return f"""<a class="row" href="/opname/{_e(r['session_id'])}">
-<div class="body">{head}
+    href = f"/opname/{_e(r['session_id'])}"
+    return f"""<div class="row">
+<a class="body" href="{href}">{head}
 <div class="meta"><span>{_e(_when(r))}</span><span>· {_e(kind)}</span>
-<span>· {_e(_duration(r.get('duration_seconds')))}</span>{patients}
-{_state_pill(r['state'])}{route}</div></div>
-<span class="open">Open</span></a>"""
+<span>· {_e(_duration(r.get('duration_seconds')))}</span>
+{_state_pill(r['state'])}{route}</div></a>
+<a class="open" href="{href}">Open</a>
+{_trash(f"/opname/{r['session_id']}/wissen", question)}</div>"""
 
 
 def _started(row: dict[str, Any]) -> str:
@@ -299,43 +379,113 @@ def _by_day(rows: list[dict[str, Any]]) -> list[tuple[str, list[dict[str, Any]]]
     return groups
 
 
+def _mmss(seconds: Any) -> str:
+    try:
+        total = int(round(float(seconds)))
+    except (TypeError, ValueError):
+        return ""
+    return f"{total // 60}:{total % 60:02d}"
+
+
+_STATUS_TEXT = {
+    "busy": "Wordt verwerkt…",
+    "failed": "Verwerken is niet gelukt. Kies hieronder opnieuw verwerken, of vraag de beheerder.",
+    "waiting": "Nog niet verwerkt.",
+    "deleted": "Dit verslag is gewist.",
+}
+
+
+def _report(p: dict[str, Any], rec: dict[str, Any], round_: bool) -> str:
+    """One patient's report, the way OurMind shows a note."""
+    idx = p["segment_index"]
+    rid = "pt" + (str(idx) if idx is not None else "0")
+    if p["status"] != "ready":
+        title = (f"Patiënt {idx}" if round_ else "Verslag")
+        body = f'<p class="sub">{_e(_STATUS_TEXT.get(p["status"], ""))}</p>'
+        tools = ""
+        if round_ and p["status"] != "deleted" and idx is not None:
+            tools = _trash(f"/opname/{rec['session_id']}/patient/{idx}/wissen",
+                           f"Patiënt {idx} uit deze visiteronde wissen?",
+                           "Deze patiënt wissen")
+        return (f'<div class="panel report" id="{rid}"><div class="rhead">'
+                f'<h2 class="rtitle">{_e(title)}</h2><div class="rtools">{tools}</div></div>'
+                f'{body}</div>')
+
+    title = p["title"] or (f"Patiënt {idx}" if round_ else "Verslag")
+    secs = []
+    full = []
+    for n, sec in enumerate(p["sections"]):
+        sid = f"{rid}-s{n}"
+        head = _e(sec["title"]) if sec["title"] else ""
+        secs.append(
+            f'<div class="sec"><div class="sechead"><b>{head}</b>'
+            f'<button class="copy" onclick="copyBlock(this, {_e(_js(sid))})">kopieer</button></div>'
+            f'<div class="sectext" id="{sid}">{_e(sec["text"])}</div></div>')
+        full.append((sec["title"] + "\n" if sec["title"] else "") + sec["text"])
+    all_id = f"{rid}-all"
+    trid = f"{rid}-tr"
+    length = _mmss(p.get("seconds"))
+    tools = (f'<button class="copy" onclick="copyBlock(this, {_e(_js(all_id))})">'
+             f'alles kopiëren</button>')
+    if round_ and idx is not None:
+        tools += _trash(f"/opname/{rec['session_id']}/patient/{idx}/wissen",
+                        f"Het verslag van patiënt {idx} wissen? Dit is definitief.",
+                        "Deze patiënt wissen")
+    transcript = p.get("transcript") or ""
+    return f"""<div class="panel report" id="{rid}">
+<div class="rhead"><h2 class="rtitle">{_e(title)}</h2><div class="rtools">{tools}</div></div>
+<div class="tabs">
+ <button class="on" data-pane="note" onclick="showTab({_e(_js(rid))},'note')">Verslag</button>
+ <button data-pane="tr" onclick="showTab({_e(_js(rid))},'tr')">Transcript{f' ({length})' if length else ''}</button>
+</div>
+<div class="pane" data-pane="note">
+ <p class="verify">Controleer het verslag altijd: AI kan fouten maken.</p>
+ {''.join(secs)}
+ <div id="{all_id}" hidden style="white-space:pre-wrap">{_e((chr(10) * 2).join(full))}</div>
+</div>
+<div class="pane" data-pane="tr" hidden>
+ <div class="headrow"><h3>Transcript</h3>
+ {'<button class="copy" onclick="copyBlock(this, %s)">kopieer</button>' % _e(_js(trid)) if transcript else ''}</div>
+ <div class="note" id="{trid}">{_e(transcript) or '<i>nog geen transcript</i>'}</div>
+</div></div>"""
+
+
 def render_recording(d: dict[str, Any], who: str) -> str:
     rec = d["recording"]
     types = {t["mode"]: t for t in d.get("types") or []}
     kind = types.get(rec["mode"], {}).get("title") or rec["mode"]
+    patients = d.get("patients") or []
+    round_ = len(patients) > 1 or any(p["segment_index"] is not None for p in patients)
+    if round_:
+        kind = "Visiteronde"
 
-    pairs = []
-    for item in d.get("results") or []:
-        # segment_index is already 1-based (sessions.patient_segments starts
-        # at 1), so adding one labelled every patient with the next patient's
-        # number -- the first consultation of a round showed up as "Patiënt 2".
-        title = ("Hele opname" if item.get("segment_index") is None
-                 else f"Patiënt {int(item['segment_index'])}")
-        if item.get("title"):
-            title = (item["title"] if item.get("segment_index") is None
-                     else f"{title} · {item['title']}")
-        transcript = item.get("transcript") or ""
-        note = item.get("note") or ""
-        key = "full" if item.get("segment_index") is None else str(item["segment_index"])
-        pairs.append(f"""<div class="panel"><h2>{_e(title)}</h2>
-<div class="two">
-  <div><div class="headrow"><h3>Verslag</h3>
-      {'<button class="copy" onclick="copyBlock(this, %s)">kopieer</button>' % repr("note-" + key) if note else ''}</div>
-    <div class="note" id="note-{_e(key)}">{_e(note) or '<i>nog geen verslag</i>'}</div></div>
-  <div><div class="headrow"><h3>Transcript</h3>
-      {'<button class="copy" onclick="copyBlock(this, %s)">kopieer</button>' % repr("tr-" + key) if transcript else ''}</div>
-    <div class="note" id="tr-{_e(key)}">{_e(transcript) or '<i>nog geen transcript</i>'}</div></div>
-</div></div>""")
-    results = "".join(pairs) or """<div class="panel"><div class="empty">
-Er is nog niets verwerkt voor deze opname.</div></div>"""
+    bar = ""
+    if round_:
+        chips = []
+        for p in patients:
+            idx = p["segment_index"]
+            label = f"Pt {idx}"
+            if p["status"] == "deleted":
+                label += " – verwijderd"
+            elif p["title"]:
+                label += f" – {p['title']}"
+            elif p["status"] == "busy":
+                label += " – wordt verwerkt"
+            elif p["status"] == "failed":
+                label += " – niet gelukt"
+            gone = " gone" if p["status"] == "deleted" else ""
+            chips.append(f'<button class="{gone.strip()}" data-pt="pt{_e(idx)}" '
+                         f'onclick="showPt(\'pt{_e(idx)}\')" title="{_e(label)}">{_e(label)}</button>')
+        bar = f'<div class="ptbar">{"".join(chips)}</div>'
+    reports = "".join(_report(p, rec, round_) for p in patients) or \
+        """<div class="panel"><div class="empty">Er is nog niets verwerkt voor deze opname.</div></div>"""
 
     routes = d.get("allowed_routes") or []
     options = "".join(f'<option value="{_e(r)}">{_e(r)}</option>' for r in routes)
     action = ""
     if rec.get("audio_purged_at"):
-        action = """<div class="panel"><p class="sub" style="margin:0">De audio van deze
-opname is na verwerking verwijderd. Het transcript en het verslag blijven hier staan;
-opnieuw verwerken kan niet meer.</p></div>"""
+        action = """<p class="sub">De audio van deze opname is na verwerking verwijderd;
+opnieuw verwerken kan niet meer. Verslag en transcript blijven hier staan.</p>"""
     elif routes and not d.get("busy"):
         action = f"""<div class="panel"><h2>Verwerken</h2>
 <p class="sub">Toegestaan voor {_e(kind)}: <b>{_e(', '.join(routes))}</b>.</p>
@@ -343,15 +493,22 @@ opnieuw verwerken kan niet meer.</p></div>"""
       style="display:flex;gap:10px;flex-wrap:wrap;align-items:center">
 <select name="route">{options}</select><button>Verwerken</button></form></div>"""
 
+    what = "visiteronde" if round_ else "opname"
+    delete_all = ('<div style="margin-top:18px">'
+                  + _trash(f"/opname/{rec['session_id']}/wissen",
+                           f"Deze hele {what} wissen? Alle verslagen en transcripten "
+                           "verdwijnen definitief.", f"Hele {what} wissen", text=True)
+                  + '</div>')
     live = ('<span class="live"><span class="dot"></span>ververst zichzelf</span>'
             if d.get("busy") else "")
     return layout("Opname", f"""
-<div class="hero"><div><h1>{_e(_when(rec))}</h1>
-<p class="sub">{_e(kind)} · {_e(_duration(rec.get('duration_seconds')))}
- · {_state_pill(rec['state'])} {live}</p></div></div>
-{action}{results}
 <p><a href="/">← alle opnames</a></p>
-<script>watch('/api/stand?opname={_e(rec['session_id'])}');</script>""",
+<div class="hero"><div><h1>{_e(_when(rec))} · {_e(kind)}</h1>
+<p class="sub">{_e(_duration(rec.get('duration_seconds')))}
+{f' · {len(patients)} patiënten' if round_ else ''}
+ · {_state_pill(rec['state'])} {live}</p></div></div>
+{bar}{reports}{action}{delete_all}
+<script>pickPt(); watch('/api/stand?opname={_e(rec['session_id'])}');</script>""",
                   active="opnames", who=who)
 
 

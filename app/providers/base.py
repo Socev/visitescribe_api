@@ -46,6 +46,9 @@ class NoteResult:
     codes: list[dict[str, Any]] = field(default_factory=list)
     usage: Usage = field(default_factory=Usage)
     provider_ref: str | None = None
+    # The report's own sections, when the provider has them (OurMind):
+    # [{"title": "S:", "text": "..."}]. Shown as separate copy blocks.
+    sections: list[dict[str, str]] = field(default_factory=list)
 
 
 class Provider(Protocol):

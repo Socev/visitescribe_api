@@ -493,6 +493,9 @@ ADDED_COLUMNS: tuple[tuple[str, str, str], ...] = (
     # Other transcribers than OurMind are off for users unless an admin
     # ticks this per user.
     ("users", "allow_other_providers", "INTEGER NOT NULL DEFAULT 0"),
+    # The report's sections as the provider gave them (1.13.0); NULL for older
+    # reports, which are split on their headings when shown.
+    ("notes", "sections_json", "TEXT"),
 )
 
 

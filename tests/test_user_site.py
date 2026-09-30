@@ -528,13 +528,14 @@ def test_patients_are_numbered_as_the_recorder_numbered_them(site, fake_ourmind,
         processing.run_once()
 
     page = site.get(f"/opname/{rec.session_id}").text
-    assert "Patiënt 1" in page
-    assert "Patiënt 2" in page
-    assert "Patiënt 3" in page
-    assert "Patiënt 4" not in page          # three segments, not four
+    assert "Pt 1 –" in page
+    assert "Pt 2 –" in page
+    assert "Pt 3 –" in page
+    assert "Pt 4" not in page               # three segments, not four
 
-    # the first block on the page really is patient 1
-    assert page.index("Patiënt 1") < page.index("Patiënt 2") < page.index("Patiënt 3")
+    # the first chip and the first report really are patient 1
+    assert page.index("Pt 1 –") < page.index("Pt 2 –") < page.index("Pt 3 –")
+    assert page.index('id="pt1"') < page.index('id="pt2"') < page.index('id="pt3"')
 
 
 def test_a_job_left_running_by_a_restart_is_picked_up_again(server, fake_ourmind,
@@ -880,9 +881,9 @@ def test_the_list_shows_what_each_recording_was_about(site, fake_ourmind, server
     _sign_in(site)
     page = site.get("/").text
     row = page[page.index(titled.session_id):]
-    row = row[:row.index("</a>")]
+    row = row[:row.index("</form>")]
     assert "Mogelijk astma met piepende ademhaling" in row
-    assert "15:48" in row and "Open" in row
+    assert "15:48" in row and "Open" in row and "wissen" in row
     other = page[page.index(bare.session_id):]
     assert "nog niet verwerkt" in other[:other.index("</a>")]
     # a title arriving changes the fingerprint the page polls
@@ -890,3 +891,199 @@ def test_the_list_shows_what_each_recording_was_about(site, fake_ourmind, server
     db.execute("UPDATE notes SET title = 'Anders', updated_at = ? "
                "WHERE session_id = ?", ("2099-01-01T00:00:00Z", titled.session_id))
     assert site.get("/api/stand").json()["stand"] != before
+
+
+# ---------------------------------------------------------------------------
+# 1.13.0: the consult view (per-section copy, visiteronde, deleting)
+
+def _round(server, site, processed=True):
+    from app import processing, users
+
+    user = users.create("dokter@praktijk.nl")
+    server.register_device("visitescribe-001")
+    users.bind_device("visitescribe-001", user["user_id"])
+    _sign_in(site)
+    rec = Recorder(server, device_id="visitescribe-001", mode="multi_patient")
+    for i in range(3):
+        rec.add_chunk(seconds=1.0, seed=i)
+    rec.create(); rec.upload_all()
+    rec.send_events([{"event": "patient_boundary", "offset_ms": 1000},
+                     {"event": "patient_boundary", "offset_ms": 2000}])
+    rec.complete()
+    if processed:
+        processing.enqueue(rec.session_id, "ourmind", actor="test")
+        for _ in range(8):
+            processing.run_once()
+    return rec
+
+
+def test_sections_are_recovered_from_a_plain_body():
+    from app.notes_view import sections_of
+
+    body = "S:\nHoest sinds 3 dagen\n\nO: Longen schoon\n\n**E:**\nVirale bovenste luchtweginfectie\n\nP:\n- Uitleg\n- Terug bij koorts"
+    secs = sections_of(body)
+    assert [s["title"] for s in secs] == ["S:", "O:", "E:", "P:"]
+    assert secs[1]["text"] == "Longen schoon"
+    assert secs[3]["text"].startswith("- Uitleg")
+    # no headings: one block, untouched
+    assert sections_of("Gewoon een zin.\nNog een.") == [{"title": "", "text": "Gewoon een zin.\nNog een."}]
+    # "Advies:" inside a plan does not split it
+    assert len(sections_of("P:\nAdvies: rust\nControle over 1 week")) == 1
+    # stored sections win
+    stored = '[{"title": "Subjectief", "text": "a"}, {"title": "P", "text": "b"}, {"title": "O", "text": ""}]'
+    assert sections_of("x", stored) == [{"title": "Subjectief", "text": "a"}, {"title": "P:", "text": "b"}]
+    assert sections_of("") == []
+
+
+def test_every_section_has_its_own_copy_button(server, site, fake_ourmind, monkeypatch):
+    from app import db, users
+
+    monkeypatch.setenv("VS_OURMIND_TOKEN", "test-token")
+    user = users.create("dokter@praktijk.nl")
+    server.register_device("visitescribe-001")
+    users.bind_device("visitescribe-001", user["user_id"])
+    _sign_in(site)
+    rec = Recorder(server, device_id="visitescribe-001")
+    rec.add_chunk(seconds=0.5)
+    rec.create(); rec.upload_all(); rec.complete()
+    ts = "2026-09-30T10:00:00Z"
+    db.execute("INSERT INTO notes(session_id, segment_index, provider, title, body, "
+               "codes_json, status, created_at, updated_at) VALUES(?,?,?,?,?,?,?,?,?)",
+               (rec.session_id, None, "ourmind", "Hoest",
+                "S:\nHoest <3 dagen\n\nO:\nLongen schoon\n\nE:\nURTI\n\nP:\nUitleg",
+                "[]", "draft", ts, ts))
+    page = site.get(f"/opname/{rec.session_id}").text
+    assert page.count('onclick="copyBlock(this, &quot;pt0-s') == 4
+    assert "alles kopiëren" in page
+    assert "Hoest &lt;3 dagen" in page            # escaped, never raw HTML
+    assert "Visiteronde" not in page
+
+
+def test_a_round_is_listed_as_a_visiteronde_and_opens_per_patient(server, site, fake_ourmind,
+                                                                  monkeypatch):
+    monkeypatch.setenv("VS_OURMIND_TOKEN", "test-token")
+    rec = _round(server, site)
+    listing = site.get("/").text
+    row = listing[listing.index(rec.session_id):]
+    assert "Visiteronde" in row[:row.index("</form>")]
+    assert "3 patiënten" in listing
+    assert listing.count('<span class="seg">Pt ') == 3
+
+    page = site.get(f"/opname/{rec.session_id}").text
+    assert 'class="ptbar"' in page
+    for n in (1, 2, 3):
+        assert f"showPt('pt{n}')" in page.replace("&#x27;", "'").replace("&#39;", "'")
+        assert f'id="pt{n}"' in page
+        assert f"/opname/{rec.session_id}/patient/{n}/wissen" in page
+    assert "pickPt()" in page
+
+
+def test_deleting_one_patient_keeps_the_numbering(server, site, fake_ourmind, monkeypatch):
+    from app import db
+
+    monkeypatch.setenv("VS_OURMIND_TOKEN", "test-token")
+    rec = _round(server, site)
+    resp = site.post(f"/opname/{rec.session_id}/patient/2/wissen", follow_redirects=False)
+    assert resp.status_code == 303
+    assert resp.headers["location"].endswith(f"/opname/{rec.session_id}#pt2")
+
+    note = db.query_one("SELECT * FROM notes WHERE session_id = ? AND segment_index = 2",
+                        (rec.session_id,))
+    assert note["status"] == "deleted" and note["body"] == "" and note["title"] == ""
+    tr = db.query_one("SELECT text FROM transcripts WHERE session_id = ? AND segment_index = 2",
+                      (rec.session_id,))
+    assert tr is None or tr["text"] == ""
+
+    page = site.get(f"/opname/{rec.session_id}").text
+    assert f"/opname/{rec.session_id}/patient/2/wissen" not in page
+    assert f"/opname/{rec.session_id}/patient/1/wissen" in page
+    assert f"/opname/{rec.session_id}/patient/3/wissen" in page
+    assert "verwijderd" in site.get("/").text
+
+    # deleting the rest removes the whole recording
+    site.post(f"/opname/{rec.session_id}/patient/1/wissen")
+    resp = site.post(f"/opname/{rec.session_id}/patient/3/wissen", follow_redirects=False)
+    assert resp.headers["location"].endswith("/?gewist=1")
+    assert db.query_one("SELECT state FROM sessions WHERE session_id = ?",
+                        (rec.session_id,))["state"] == "PURGED"
+
+
+def test_deleting_a_recording_removes_everything_but_the_trace(server, site, fake_ourmind,
+                                                               monkeypatch):
+    from app import db
+
+    monkeypatch.setenv("VS_OURMIND_TOKEN", "test-token")
+    rec = _round(server, site)
+    resp = site.post(f"/opname/{rec.session_id}/wissen", follow_redirects=False)
+    assert resp.status_code == 303 and resp.headers["location"].endswith("/?gewist=1")
+    for table in ("notes", "transcripts", "chunks"):
+        assert db.query_one(f"SELECT COUNT(*) AS n FROM {table} WHERE session_id = ?",
+                            (rec.session_id,))["n"] == 0
+    assert "user_delete" in {r["scope"] for r in db.query(
+        "SELECT scope FROM purges WHERE session_id = ?", (rec.session_id,))}
+    # the page itself is gone, the list says so, the recording is not listed
+    assert site.get(f"/opname/{rec.session_id}", follow_redirects=False).status_code in (302, 303, 307)
+    listing = site.get("/?gewist=1").text
+    assert "Opname gewist." in listing
+    assert rec.session_id not in listing
+
+
+def test_only_the_owner_can_delete(server, site, fake_ourmind, monkeypatch):
+    from app import db, users
+
+    monkeypatch.setenv("VS_OURMIND_TOKEN", "test-token")
+    rec = _round(server, site, processed=False)
+    site.cookies.clear()
+    Fake.known_emails.add("ander@praktijk.nl")
+    users.create("ander@praktijk.nl")
+    _sign_in(site, "ander@praktijk.nl")
+    resp = site.post(f"/opname/{rec.session_id}/wissen", follow_redirects=False)
+    assert resp.status_code in (403, 404)
+    resp = site.post(f"/opname/{rec.session_id}/patient/1/wissen", follow_redirects=False)
+    assert resp.status_code in (403, 404)
+    assert db.query_one("SELECT state FROM sessions WHERE session_id = ?",
+                        (rec.session_id,))["state"] != "PURGED"
+
+
+def test_a_deleted_patient_is_never_brought_back_by_a_waiting_job(server, site, fake_ourmind,
+                                                                   monkeypatch):
+    from app import db, processing, retention
+
+    monkeypatch.setenv("VS_OURMIND_TOKEN", "test-token")
+    rec = _round(server, site, processed=False)
+    processing.enqueue(rec.session_id, "ourmind", actor="test")
+    retention.delete_patient(rec.session_id, 2, who="test")
+    for _ in range(10):
+        processing.run_once()
+    note = db.query_one("SELECT * FROM notes WHERE session_id = ? AND segment_index = 2",
+                        (rec.session_id,))
+    assert note["status"] == "deleted" and note["body"] == ""
+    others = db.query("SELECT status FROM notes WHERE session_id = ? AND segment_index != 2",
+                      (rec.session_id,))
+    assert len(others) == 2 and all(o["status"] != "deleted" for o in others)
+    state = db.query_one("SELECT state FROM sessions WHERE session_id = ?",
+                         (rec.session_id,))["state"]
+    assert "FAILED" not in state
+
+
+def test_a_deleted_recording_is_not_touched_by_a_waiting_job(server, site, fake_ourmind,
+                                                             monkeypatch):
+    from app import db, processing, retention
+
+    monkeypatch.setenv("VS_OURMIND_TOKEN", "test-token")
+    rec = _round(server, site, processed=False)
+    processing.enqueue(rec.session_id, "ourmind", actor="test")
+    db.execute("UPDATE processing_jobs SET state = 'queued' WHERE session_id = ?",
+               (rec.session_id,))
+    retention.delete_recording(rec.session_id, who="test")
+    db.execute("UPDATE processing_jobs SET state = 'queued' WHERE session_id = ?",
+               (rec.session_id,))           # as if it slipped past the cancel
+    for _ in range(5):
+        processing.run_once()
+    assert db.query_one("SELECT state FROM sessions WHERE session_id = ?",
+                        (rec.session_id,))["state"] == "PURGED"
+    assert db.query_one("SELECT COUNT(*) AS n FROM notes WHERE session_id = ?",
+                        (rec.session_id,))["n"] == 0
+    assert {j["state"] for j in db.query("SELECT state FROM processing_jobs WHERE session_id = ?",
+                                         (rec.session_id,))} == {"cancelled"}
+

@@ -244,6 +244,29 @@ authorisation model — every read on the site joins through `devices.user_id`,
 so a missing filter is a missing join and fails loudly rather than showing
 someone else's consultations.
 
+### Reading, copying and deleting a report (1.13.0)
+
+A report is shown the way the doctor copies it into the HIS: one block per
+section (S, O, E, P, or whatever headings the template uses), each with its own
+copy button, plus "alles kopiëren". OurMind's sections are stored as they
+arrive (`notes.sections_json`); older reports and other providers are split on
+their headings (`app/notes_view.py`), and a body without recognisable headings
+stays one block rather than being guessed at.
+
+A recording with more than one patient is listed as a **Visiteronde** with one
+line per patient ("Pt 1 …", "Pt 2 …"), numbered as the recorder numbered them.
+Opening it shows the patients as chips at the top; each opens its own report
+and transcript.
+
+Deleting is final after one confirmation; there is no trash can. It removes the
+report, the transcript and any remaining audio here; a copy in the doctor's own
+OurMind account is not touched. In a round one patient can be deleted: the
+numbering stays (Pt 3 remains Pt 3, marked "verwijderd"), queued work for that
+patient is cancelled and can never bring it back, and deleting the last one
+removes the whole recording. What remains of a deleted recording is the trace:
+the session row in state `PURGED`, a `purges` row (scope `user_delete`) and the
+audit record.
+
 ### Recording types are rows, not an enum
 
 `recording_types` is a table. A mode the server has never seen — a future

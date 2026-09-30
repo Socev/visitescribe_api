@@ -17,7 +17,8 @@ from typing import Any
 from fastapi import FastAPI, Form, Request, Response
 from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse
 
-from . import audit, db, fleet, processing, routing, sessions, userauth, users
+from . import (audit, db, fleet, notes_view, processing, retention, routing, sessions,
+               userauth, users)
 from .bootstrap import initialise
 from .config import settings
 from .errors import ApiError, api_error_handler, unhandled_handler
@@ -76,12 +77,14 @@ def _recordings_of(user_id: str, limit: int = 200) -> list[dict[str, Any]]:
     if by_id:
         marks = ",".join("?" * len(by_id))
         for note in db.query(
-                f"SELECT session_id, segment_index, title FROM notes "
+                f"SELECT session_id, segment_index, title, status FROM notes "
                 f"WHERE session_id IN ({marks}) ORDER BY IFNULL(segment_index, 0)",
                 tuple(by_id)):
-            if note["title"]:
+            deleted = note["status"] == "deleted"
+            if note["title"] or deleted:
                 by_id[note["session_id"]]["titles"].append(
-                    {"segment_index": note["segment_index"], "title": note["title"]})
+                    {"segment_index": note["segment_index"], "title": note["title"],
+                     "deleted": deleted})
     return out
 
 
@@ -95,6 +98,55 @@ def _recording_of(user_id: str, session_id: str) -> dict[str, Any]:
         raise ApiError("UNKNOWN_SESSION", "Deze opname bestaat niet.",
                        status_code=404)
     return dict(row)
+
+
+def _patients_of(session_id: str, results: dict[str, Any]) -> list[dict[str, Any]]:
+    """One entry per patient of a recording (a single one for a plain consult).
+
+    What each patient's tab needs: its report split into sections, its
+    transcript and length, and where it stands (ready, busy, failed, deleted).
+    segment_index None means the whole recording is one patient.
+    """
+    notes = {n["segment_index"]: n for n in results["notes"]}
+    transcripts = {t["segment_index"]: t for t in results["transcripts"]}
+    jobs: dict[Any, list[dict[str, Any]]] = {}
+    for j in results["jobs"]:
+        jobs.setdefault(j["segment_index"], []).append(j)
+    keys = set(notes) | set(transcripts) | set(jobs)
+    segments = sessions.patient_segments(session_id)
+    if len(segments) > 1:
+        keys |= {int(s["index"]) for s in segments}
+    if not keys:
+        keys = {None}
+    out = []
+    for key in sorted(keys, key=lambda k: (k is not None, k if k is not None else 0)):
+        note = notes.get(key) or {}
+        tr = transcripts.get(key) or {}
+        states = [j["state"] for j in jobs.get(key, [])]
+        if note.get("status") == "deleted":
+            status = "deleted"
+        elif note.get("body"):
+            status = "ready"
+        elif any(s in ("queued", "running") for s in states):
+            status = "busy"
+        elif "failed" in states:
+            status = "failed"
+        else:
+            status = "waiting"
+        seg = next((s for s in segments if s["index"] == key), None)
+        seconds = tr.get("audio_seconds")
+        if seconds is None and seg and seg.get("duration_ms") is not None:
+            seconds = seg["duration_ms"] / 1000.0
+        out.append({
+            "segment_index": key,
+            "title": note.get("title") or "",
+            "status": status,
+            "sections": notes_view.sections_of(note.get("body"), note.get("sections_json"))
+            if status == "ready" else [],
+            "transcript": tr.get("text") or "",
+            "seconds": seconds,
+        })
+    return out
 
 
 def create_user_app() -> FastAPI:
@@ -149,33 +201,43 @@ def create_user_app() -> FastAPI:
         return HTMLResponse(render_recordings({
             "recordings": _recordings_of(user["user_id"]),
             "types": users.recording_types(),
+            "notice": "Opname gewist." if request.query_params.get("gewist") else "",
         }, _who(user)))
 
     @app.get("/opname/{session_id}", response_class=HTMLResponse)
     async def recording(session_id: str, request: Request) -> Response:
         user = userauth.require_user(request)
         rec = _recording_of(user["user_id"], session_id)
+        if rec["state"] == "PURGED":
+            return RedirectResponse("/", status_code=303)
         rec["duration_seconds"] = (db.query_one(
             "SELECT SUM(json_extract(flac_json,'$.duration_ms')) / 1000.0 AS d "
             "FROM chunks WHERE session_id = ?", (session_id,)) or {})["d"]
         results = processing.results_for(session_id)
-        by_segment: dict[Any, dict[str, Any]] = {}
-        for item in results["transcripts"]:
-            by_segment.setdefault(item["segment_index"], {})["transcript"] = item["text"]
-        for item in results["notes"]:
-            entry = by_segment.setdefault(item["segment_index"], {})
-            entry["note"] = item["body"]
-            entry["title"] = item.get("title") or ""
-        merged = [{"segment_index": k, **v} for k, v in sorted(
-            by_segment.items(), key=lambda kv: (kv[0] is not None, kv[0]))]
         busy = any(j["state"] in ("queued", "running") for j in results["jobs"])
         return HTMLResponse(render_recording({
             "recording": rec,
-            "results": merged,
+            "patients": _patients_of(session_id, results),
             "types": users.recording_types(),
             "allowed_routes": sorted(routing.allowed_for_user(rec["mode"], user)),
             "busy": busy,
         }, _who(user)))
+
+    @app.post("/opname/{session_id}/wissen")
+    async def delete_recording(session_id: str, request: Request) -> Response:
+        user = userauth.require_user(request)
+        _recording_of(user["user_id"], session_id)      # authorisation
+        retention.delete_recording(session_id, who=user["email"])
+        return RedirectResponse("/?gewist=1", status_code=303)
+
+    @app.post("/opname/{session_id}/patient/{segment}/wissen")
+    async def delete_patient(session_id: str, segment: int, request: Request) -> Response:
+        user = userauth.require_user(request)
+        _recording_of(user["user_id"], session_id)      # authorisation
+        result = retention.delete_patient(session_id, segment, who=user["email"])
+        if (sessions.get(session_id) or {}).get("state") == "PURGED":
+            return RedirectResponse("/?gewist=1", status_code=303)
+        return RedirectResponse(f"/opname/{session_id}#pt{segment}", status_code=303)
 
     @app.post("/opname/{session_id}/verwerken")
     async def process(session_id: str, request: Request,

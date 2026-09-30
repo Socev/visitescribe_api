@@ -229,3 +229,91 @@ def audio_status(session: dict[str, Any]) -> dict[str, Any]:
                 "label": f"Bewaard (diagnostische modus) tot {until or '?'}"}
     return {"state": "present",
             "label": "Wordt verwijderd zodra de verwerking klaar is"}
+
+
+# ---------------------------------------------------------------------------
+# deleting by the doctor (user site, 1.13.0)
+# ---------------------------------------------------------------------------
+
+def delete_recording(session_id: str, *, who: str) -> dict[str, Any]:
+    """Remove a recording for good: audio, transcripts and reports.
+
+    What stays is the fact that it existed and was deleted (the session row in
+    state PURGED, the purge record and the audit trail), as with an admin
+    purge. A copy in the doctor's own OurMind account is not touched.
+    """
+    session = sessions.get(session_id)
+    if session is None:
+        from .errors import ApiError
+
+        raise ApiError("UNKNOWN_SESSION", "Deze opname bestaat niet.", status_code=404)
+    removed = 0
+    for row in db.query("SELECT plaintext_blob_path FROM chunks WHERE session_id = ? "
+                        "AND plaintext_blob_path IS NOT NULL", (session_id,)):
+        if storage.delete_blob(row["plaintext_blob_path"]):
+            removed += 1
+    removed += storage.delete_session_blobs(session_id)
+    shutil.rmtree(settings.data_dir / "work" / session_id, ignore_errors=True)
+    crypto.drop_session_key(session_id)
+    ts = now_iso()
+    with db.tx() as conn:
+        conn.execute("UPDATE processing_jobs SET state = 'cancelled', updated_at = ? "
+                     "WHERE session_id = ? AND state IN ('queued', 'running')",
+                     (ts, session_id))
+        notes = conn.execute("DELETE FROM notes WHERE session_id = ?", (session_id,)).rowcount
+        trans = conn.execute("DELETE FROM transcripts WHERE session_id = ?",
+                             (session_id,)).rowcount
+        conn.execute("DELETE FROM chunks WHERE session_id = ?", (session_id,))
+        conn.execute(
+            "UPDATE sessions SET state = 'PURGED', wrap_ciphertext_b64 = NULL, "
+            "purged_at = ?, audio_purged_at = COALESCE(audio_purged_at, ?), "
+            "updated_at = ? WHERE session_id = ?", (ts, ts, ts, session_id))
+        conn.execute(
+            "INSERT INTO purges(session_id, scope, actor, ts, detail_json) VALUES(?,?,?,?,?)",
+            (session_id, "user_delete", who, ts,
+             json.dumps({"files_removed": removed, "notes": notes, "transcripts": trans})))
+        audit.log("purge", "deleted_by_user", "success", session_id=session_id,
+                  device_id=session["device_id"], identity=who,
+                  detail={"files_removed": removed, "notes": notes,
+                          "transcripts": trans}, conn=conn)
+    return {"session_id": session_id, "deleted": True}
+
+
+def delete_patient(session_id: str, segment_index: int, *, who: str) -> dict[str, Any]:
+    """Remove one patient's report and transcript from a round.
+
+    The round keeps its numbering: Pt 3 stays Pt 3 with "verwijderd" on it, so
+    the doctor never mixes up which report belongs to which visit. When the
+    last patient goes, the whole recording goes (delete_recording).
+    """
+    session = sessions.get(session_id)
+    if session is None:
+        from .errors import ApiError
+
+        raise ApiError("UNKNOWN_SESSION", "Deze opname bestaat niet.", status_code=404)
+    ts = now_iso()
+    with db.tx() as conn:
+        conn.execute("UPDATE processing_jobs SET state = 'cancelled', updated_at = ? "
+                     "WHERE session_id = ? AND segment_index = ? "
+                     "AND state IN ('queued', 'running')", (ts, session_id, segment_index))
+        cur = conn.execute(
+            "UPDATE notes SET title = '', body = '', sections_json = NULL, "
+            "codes_json = '[]', status = 'deleted', updated_at = ? "
+            "WHERE session_id = ? AND segment_index = ?", (ts, session_id, segment_index))
+        if not cur.rowcount:
+            conn.execute(
+                "INSERT INTO notes(session_id, segment_index, provider, title, body, "
+                "status, created_at, updated_at) VALUES(?,?,?,?,?,?,?,?)",
+                (session_id, segment_index, "deleted", "", "", "deleted", ts, ts))
+        conn.execute("UPDATE transcripts SET text = '', segments_json = '[]' "
+                     "WHERE session_id = ? AND segment_index = ?", (session_id, segment_index))
+        audit.log("purge", "patient_deleted_by_user", "success", session_id=session_id,
+                  device_id=session["device_id"], identity=who,
+                  detail={"segment": segment_index}, conn=conn)
+    total = len(sessions.patient_segments(session_id)) or 1
+    deleted = int((db.query_one(
+        "SELECT COUNT(*) AS n FROM notes WHERE session_id = ? AND status = 'deleted'",
+        (session_id,)) or {"n": 0})["n"])
+    if deleted >= total:
+        return delete_recording(session_id, who=who)
+    return {"session_id": session_id, "segment": segment_index, "deleted": True}

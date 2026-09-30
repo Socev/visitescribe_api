@@ -290,6 +290,18 @@ def _describe(exc: Exception) -> str:
     return " | ".join(parts)
 
 
+_WITHDRAWN = ("SESSION_PURGED", "PATIENT_DELETED")
+
+
+def _withdraw(job: dict[str, Any], exc: Exception) -> None:
+    """The doctor deleted what this job was for: stop quietly. Not a failure,
+    and the session state (PURGED, or the rest of the round) is left alone."""
+    ts = now_iso()
+    db.execute("UPDATE processing_jobs SET state = 'cancelled', error = ?, error_code = ?, "
+               "finished_at = ?, updated_at = ? WHERE id = ?",
+               (str(exc)[:500], getattr(exc, "code", ""), ts, ts, job["id"]))
+
+
 def _fail(job: dict[str, Any], exc: Exception, retryable: bool) -> None:
     attempts = int(job["attempts"]) + 1
     give_up = (not retryable) or attempts >= MAX_ATTEMPTS
@@ -418,10 +430,34 @@ def recording_title(session: dict[str, Any], segment_index: int | None) -> str:
     return " - ".join(parts)
 
 
+def _patient_deleted(session_id: str, segment_index: int | None) -> bool:
+    """The doctor deleted this patient from the round (retention.delete_patient)."""
+    if segment_index is None:
+        return False
+    row = db.query_one("SELECT status FROM notes WHERE session_id = ? AND segment_index = ?",
+                       (session_id, segment_index))
+    return bool(row and row["status"] == "deleted")
+
+
+def _still_wanted(job: dict[str, Any]) -> None:
+    """Re-checked just before a result is stored: the doctor may have deleted
+    the recording or this patient while the provider was working."""
+    current = sessions.get(job["session_id"])
+    if current is None or current["state"] == "PURGED":
+        raise ApiError("SESSION_PURGED", "Deze opname is gewist")
+    if _patient_deleted(job["session_id"], job["segment_index"]):
+        raise ApiError("PATIENT_DELETED", "Deze patiënt is uit de visiteronde gewist")
+
+
 def run_job(job: dict[str, Any]) -> None:
     session = sessions.get(job["session_id"])
     if session is None:
         raise ApiError("UNKNOWN_SESSION", "Session disappeared")
+    if session["state"] == "PURGED":
+        # Deleted (by the doctor or an admin) while this job waited.
+        raise ApiError("SESSION_PURGED", "Deze opname is gewist")
+    if _patient_deleted(job["session_id"], job["segment_index"]):
+        raise ApiError("PATIENT_DELETED", "Deze patiënt is uit de visiteronde gewist")
     routing.check(session["mode"], job["route"])   # re-checked before anything leaves
 
     # Whose recording is this? The device was bound to a user by an admin, and
@@ -540,6 +576,7 @@ def run_job(job: dict[str, Any]) -> None:
                               result.model, "transcribe", result.usage,
                               eu_endpoint=getattr(provider, "eu_endpoint", False))
 
+        _still_wanted(job)
         ts = now_iso()
         with db.tx() as conn:
             conn.execute(
@@ -610,19 +647,25 @@ def run_job(job: dict[str, Any]) -> None:
                           note.model, "note", note.usage,
                           eu_endpoint=getattr(provider, "eu_endpoint", False))
 
+    _still_wanted(job)
     ts = now_iso()
     with db.tx() as conn:
         conn.execute(
             "INSERT INTO notes(session_id, segment_index, provider, model, template, "
-            "title, body, codes_json, status, created_at, updated_at) "
-            "VALUES(?,?,?,?,?,?,?,?,'draft',?,?) "
+            "title, body, codes_json, sections_json, status, created_at, updated_at) "
+            "VALUES(?,?,?,?,?,?,?,?,?,'draft',?,?) "
             "ON CONFLICT(session_id, IFNULL(segment_index, -1)) DO UPDATE SET "
             "provider = excluded.provider, model = excluded.model, "
             "template = excluded.template, title = excluded.title, "
             "body = excluded.body, codes_json = excluded.codes_json, "
-            "status = 'draft', updated_at = excluded.updated_at",
+            "sections_json = excluded.sections_json, "
+            "status = 'draft', updated_at = excluded.updated_at "
+            "WHERE notes.status != 'deleted'",
             (job["session_id"], segment_index, job["route"], note.model, note.template,
-             note.title, note.body, json.dumps(note.codes, default=str), ts, ts),
+             note.title, note.body, json.dumps(note.codes, default=str),
+             json.dumps(getattr(note, "sections", None) or []) if getattr(
+                 note, "sections", None) else None,
+             ts, ts),
         )
         conn.execute(
             "UPDATE processing_jobs SET state = 'done', finished_at = ?, updated_at = ?, "
@@ -664,10 +707,13 @@ def run_once() -> bool:
              job["session_id"], job["route"])
     try:
         run_job(job)
+    except ApiError as exc:
+        if getattr(exc, "code", "") in _WITHDRAWN:
+            _withdraw(job, exc)
+        else:
+            _fail(job, exc, retryable=False)
     except ProviderError as exc:
         _fail(job, exc, retryable=exc.retryable)
-    except ApiError as exc:
-        _fail(job, exc, retryable=False)
     except Exception as exc:  # noqa: BLE001
         log.exception("job %s crashed", job["id"])
         _fail(job, exc, retryable=True)

@@ -311,6 +311,7 @@ class OurMindProvider:
                 full = f"{prefix} - {described}"
             self._set_report_title(consultation, report, _clean_title(full))
         note = NoteResult(
+            sections=[{"title": title, "text": body_} for _, title, body_ in parts if body_],
             body=text,
             title=described or None,
             model="ourmind",
